@@ -1,5 +1,6 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,6 +28,17 @@ const posterOf = async (id) => {
   assert.equal(res.status, 200);
   return Buffer.from(await res.arrayBuffer());
 };
+/* a film's first poster, asked for again while it is being drawn (503), as a card does */
+const firstPosterOf = async (id) => {
+  for (const end = Date.now() + 60_000; Date.now() < end; await new Promise((r) => setTimeout(r, 250))) {
+    const res = await api(`/api/projects/${id}/poster`);
+    if (res.status !== 503) {
+      assert.equal(res.status, 200);
+      return Buffer.from(await res.arrayBuffer());
+    }
+  }
+  assert.fail('never drawn');
+};
 
 test('a project\'s card: its film\'s poster; once the film changes, the last one at once while the new one is drawn', async () => {
   const { project } = await (await api('/api/projects', { method: 'POST', body: { path: join(scratch, 'Card') } })).json();
@@ -36,8 +48,8 @@ test('a project\'s card: its film\'s poster; once the film changes, the last one
   </script></body>`);
   page('#f00');
   writeFileSync(join(project.path, 'film.html'), filmHtml({ tracks: [{ clips: [{ src: 'p.html' }] }] }));
-  /* never drawn: waited for */
-  const red = await posterOf(project.id);
+  /* never drawn: drawn, asked for again meanwhile */
+  const red = await firstPosterOf(project.id);
   assert.deepEqual([...red.subarray(0, 2)], [0xff, 0xd8]);
   assert.ok(existsSync(join(project.path, '.film', 'cache', 'film-poster.jpg')), 'kept as the film\'s last poster');
 
@@ -54,6 +66,22 @@ test('a project\'s card: its film\'s poster; once the film changes, the last one
     fresh = await posterOf(project.id);
   }
   assert.ok(!fresh.equals(red), 'the changed film\'s poster, next time');
+});
+
+test('a card waits a moment only for a film\'s first poster: drawn on, it is asked for again (the request held no connection)', async () => {
+  const { project } = await (await api('/api/projects', { method: 'POST', body: { path: join(scratch, 'Slow') } })).json();
+  writeFileSync(join(project.path, 'p.html'), `<!doctype html><body style="margin:0;background:#0a0"><script>
+    window.film = { duration: 2, ready: new Promise((r) => setTimeout(r, 6000)), frame() {} };
+  </script></body>`);
+  writeFileSync(join(project.path, 'film.html'), filmHtml({ tracks: [{ clips: [{ src: 'p.html' }] }] }));
+  const t0 = Date.now();
+  const res = await api(`/api/projects/${project.id}/poster`);
+  assert.equal(res.status, 503);
+  assert.equal(res.headers.get('retry-after'), '5');
+  assert.equal((await res.json()).code, 'drawing');
+  assert.ok(Date.now() - t0 < 4000, 'answered within moments');
+  const poster = await firstPosterOf(project.id);
+  assert.deepEqual([...poster.subarray(0, 2)], [0xff, 0xd8]);
 });
 
 test('a film that has nothing in it has no poster', async () => {
@@ -81,6 +109,21 @@ test('a page\'s thumbnail follows the files the page loads: a stylesheet it shar
   assert.ok(!blue.body.equals(red.body), 'the page drawn again with its new style');
 });
 
+test('a page\'s poster is drawn clear, what it leaves unpainted transparent; its frames on the timeline, on black', async () => {
+  const { project } = await (await api('/api/projects', { method: 'POST', body: { path: join(scratch, 'Clear') } })).json();
+  writeFileSync(join(project.path, 'p.html'), '<!doctype html><body style="margin:0"><div style="margin:40px;width:200px;height:200px;background:#fc0"></div><script>window.film = { duration: 2, frame() {} };</script></body>');
+  const media = async (q) => {
+    const res = await api(`/api/projects/${project.id}/media?path=p.html&${q}`);
+    assert.equal(res.status, 200);
+    return { type: res.headers.get('content-type'), body: Buffer.from(await res.arrayBuffer()) };
+  };
+  const poster = await media('what=poster');
+  assert.equal(poster.type, 'image/webp');
+  assert.ok(poster.body.includes(Buffer.from('ALPH')), 'it keeps an alpha channel');
+  const frame = await media('what=frame&ms=500&w=160');
+  assert.equal(frame.type, 'image/jpeg');
+});
+
 test('a page clip\'s thumbnail shows the changes made in it (its overrides): another change, another picture', async () => {
   const { project } = await (await api('/api/projects', { method: 'POST', body: { path: join(scratch, 'Tweaked') } })).json();
   writeFileSync(join(project.path, 'p.html'), '<!doctype html><body style="margin:0;background:#fff"><div id="box" style="width:960px;height:1080px;background:#f00"></div><script>window.film = { duration: 2, frame() {} };</script></body>');
@@ -95,6 +138,26 @@ test('a page clip\'s thumbnail shows the changes made in it (its overrides): ano
   assert.ok((await frame(false)).equals(plain), 'the page itself, asked without its clip, is as it was');
   film([{ at: '#box', style: { backgroundColor: '#00f' } }]);
   assert.ok(!(await frame(true)).equals(moved), 'changed again: drawn again');
+});
+
+/** A JPEG's width and height, from its frame header. @param {Buffer} jpeg */
+function jpegSize(jpeg) {
+  for (let i = 2; i + 9 < jpeg.length;) {
+    const marker = jpeg[i + 1];
+    if (marker >= 0xc0 && marker <= 0xc3) return { w: jpeg.readUInt16BE(i + 7), h: jpeg.readUInt16BE(i + 5) };
+    i += 2 + jpeg.readUInt16BE(i + 2);
+  }
+  return null;
+}
+
+test('a page clip with a size is drawn laid out at it, as the film lays it out: a portrait page is a portrait picture', async () => {
+  const { project } = await (await api('/api/projects', { method: 'POST', body: { path: join(scratch, 'Portrait') } })).json();
+  /* a page with no size of its own: laid out at what it is given, its box half of the width it gets */
+  writeFileSync(join(project.path, 'p.html'), '<!doctype html><body style="margin:0;background:#fff"><div style="width:50vw;height:100vh;background:#f00"></div><script>window.film = { duration: 2, frame() {} };</script></body>');
+  writeFileSync(join(project.path, 'film.html'), filmHtml({ tracks: [{ clips: [{ id: 'p', src: 'p.html', size: { w: 1080, h: 1920 } }] }] }));
+  const frame = async (clip) => Buffer.from(await (await api(`/api/projects/${project.id}/media?what=frame&path=p.html&ms=500&w=160${clip ? '&clip=p' : ''}`)).arrayBuffer());
+  assert.deepEqual(jpegSize(await frame(true)), { w: 160, h: 284 }, 'the clip: 1080 × 1920');
+  assert.deepEqual(jpegSize(await frame(false)), { w: 160, h: 90 }, 'the page on its own: 1920 × 1080');
 });
 
 test('a page that never gets ready (a loop that never ends) fails in its own time, and the pages after it are drawn', async () => {
@@ -115,6 +178,23 @@ test('a page that never gets ready (a loop that never ends) fails in its own tim
   assert.ok(Date.now() - t1 < 2000);
 });
 
+test('a thumbnails browser that is ended (it crashed, or took too much memory) is let go: the next frame starts another', { skip: process.platform === 'win32' && 'no ps', timeout: 120_000 }, async () => {
+  const { project } = await (await api('/api/projects', { method: 'POST', body: { path: join(scratch, 'Ended') } })).json();
+  writeFileSync(join(project.path, 'p.html'), '<!doctype html><body style="background:#06c"><script>window.film = { duration: 4, frame() {} };</script></body>');
+  writeFileSync(join(project.path, 'film.html'), filmHtml({ tracks: [{ clips: [{ src: 'p.html' }] }] }));
+  const frame = (ms) => api(`/api/projects/${project.id}/media?what=frame&path=p.html&ms=${ms}&w=160`);
+  assert.equal((await frame(500)).status, 200);
+  /* the browsers this process started (the host marks each), ended as the system or the memory guard ends one */
+  const ours = execFileSync('/bin/ps', ['-axo', 'pid=,ppid=,command='], { encoding: 'utf8' }).split('\n')
+    .map((r) => r.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/)).filter((m) => m && Number(m[2]) === process.pid && m[3].includes('--openfilm-browser='));
+  assert.ok(ours.length >= 1);
+  for (const m of ours) process.kill(Number(m[1]), 'SIGKILL');
+  await new Promise((r) => setTimeout(r, 500));
+  const t0 = Date.now();
+  assert.equal((await frame(1500)).status, 200, 'drawn by a new browser');
+  assert.ok(Date.now() - t0 < 20_000, 'at once, not after the old one is given up on');
+});
+
 test('a page asked for by a path out of the project (`../`) is not there: never opened, probed or drawn', async () => {
   const { project } = await (await api('/api/projects', { method: 'POST', body: { path: join(scratch, 'Asker') } })).json();
   mkdirSync(join(scratch, 'Elsewhere'), { recursive: true });
@@ -133,4 +213,15 @@ test('a page\'s facts: its own size, or none (reflows: shown alone at 1920 × 10
   const facts = async (path) => (await api(`/api/projects/${project.id}/media?what=probe&path=${path}`)).json();
   assert.deepEqual(await facts('chart.html'), { width: 480, height: 320 });
   assert.deepEqual(await facts('cards.html'), { duration: 5, width: 1920, height: 1080, reflows: true });
+});
+
+const hasFfmpeg = (() => { try { execFileSync('ffmpeg', ['-version'], { stdio: 'ignore' }); return true; } catch { return false; } })();
+
+test('a film whose footage no browser decodes (ProRes) has its picture on its card, through a copy', { skip: !hasFfmpeg && 'no ffmpeg', timeout: 120_000 }, async () => {
+  const { project } = await (await api('/api/projects', { method: 'POST', body: { path: join(scratch, 'ProRes') } })).json();
+  execFileSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=0x2060c0:size=320x180:rate=30', '-t', '2', '-c:v', 'prores_ks', '-profile:v', '3', join(project.path, 'a.mov')]);
+  writeFileSync(join(project.path, 'film.html'), filmHtml({ stage: { w: 320, h: 180 }, tracks: [{ clips: [{ id: 'v', src: 'a.mov', at: 0, time: [0, 2] }] }] }));
+  const jpeg = await firstPosterOf(project.id);
+  const [r, g, b] = execFileSync('ffmpeg', ['-v', 'error', '-f', 'image2pipe', '-i', '-', '-frames:v', '1', '-vf', 'crop=4:4:iw/2:ih/2,format=rgb24', '-f', 'rawvideo', '-'], { input: jpeg });
+  assert.ok(Math.abs(r - 0x20) < 20 && Math.abs(g - 0x60) < 20 && Math.abs(b - 0xc0) < 20, `the footage's colour: ${r},${g},${b}`);
 });

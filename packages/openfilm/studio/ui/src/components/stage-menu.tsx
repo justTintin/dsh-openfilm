@@ -1,20 +1,24 @@
 /**
- * The stage's context menus (FilmStageSelect asks for one on a right-click): as in Figma, what was hit decides the
+ * The stage's context menus (FilmStageSelect asks for one on a right-click): what was hit decides the
  * list. A layer inside a page, a whole clip (the same actions as its block on the timeline), several layers boxed
  * together; and after them on every menu, Show… / Unlock… for the layers that cannot be clicked any more. Items that
  * cannot run stay, grayed, with the reason.
  *
- * Layer changes are overrides (the editor writes film.html); the clip's actions are the editor's, passed in.
+ * Layer changes are overrides (the editor writes film.html), a delete too (lib/layer-delete); a copy of layers is
+ * pasted as new elements of a page (lib/layer-clipboard); the clip's actions are the editor's, passed in.
  */
+import type * as React from 'react';
 import {
-  BringToFront, ClipboardPaste, Copy as CopyIcon, CopyPlus, CornerLeftUp, Download, Eye, EyeOff, Layers, Lock,
-  RotateCcw, Scissors, SendToBack, Trash2, Type as TypeIcon, Unlock,
+  BringToFront, ClipboardPaste, Copy as CopyIcon, CopyPlus, CornerLeftUp, Crop as CropIcon, Download, Eye, EyeOff, HardDriveUpload,
+  ImageIcon, ImageUp, Layers, Lock, RotateCcw, Scissors, SendToBack, SquareDashed, Trash2, Type as TypeIcon, Unlock,
 } from 'lucide-react';
 
 import type { ContextMenuEntry } from '@/components/ContextMenu';
 import type { FilmDoc } from '@/lib/film';
 import type { OverrideGeometry } from '@/lib/film-overrides';
 import { shortcutHint } from '@/lib/shortcut-hint';
+import { hintOf } from '@/lib/keymap';
+import { currentKeymap, MAC } from '@/lib/keymap-store';
 import type { AlignEdge } from '@/lib/stage-gesture';
 import { recoverableLayers, type RecoverableLayer } from '@/lib/stage-layers';
 import type { StageElement } from '@/lib/stage-types';
@@ -41,6 +45,12 @@ export interface StageMenuContext {
   multi?: readonly StageElement[];
   /** Line them up with an edge / middle of their union box (one save). */
   align?: (edge: AlignEdge) => void;
+  /** Space three or more evenly across or down (one save), under Align. */
+  distribute?: (axis: 'x' | 'y') => void;
+  /** Crop the video or still in hand in place (C); only for one that can be. */
+  crop?: () => void;
+  /** A whole clip's Mask: the shapes, the one on it checked (the picture's own: they open its Mask section). */
+  mask?: readonly ContextMenuEntry[];
   /** The layer (or a layer around it) is locked. */
   locked?: boolean;
 }
@@ -73,6 +83,10 @@ export interface StageMenuActions {
   editOverride(element: StageElement, patch: OverrideGeometry | null): void;
   /** Several layers' overrides at once: one save, one undo step. */
   editOverrides(list: ReadonlyArray<{ element: StageElement; patch: OverrideGeometry | null }>): void;
+  /** Layers deleted from their clips (lib/layer-delete): one save, one undo step; without it a layer has no Delete. */
+  deleteLayers?(elements: readonly StageElement[]): void;
+  /** Layers copied (lib/layer-clipboard); without it a layer has no Copy. Paste is the clip's (it pastes what was copied). */
+  copyLayers?(elements: readonly StageElement[]): void;
   /** Select the layer at `loc` in the clip at `clipLoc` (a parent). */
   selectParent(loc: string, clipLoc?: string): void;
   /** Select the whole clip (as on the timeline). */
@@ -81,6 +95,46 @@ export interface StageMenuActions {
   notify?(message: string): void;
   /** The whole clip's actions; without them a clip's menu is empty. */
   clip?: StageClipActions;
+  /** Another file in a picture's place; without it a picture has no Replace. */
+  picture?: StagePictureActions;
+}
+
+/** Replacing the picture a layer draws (an <img>, a box painted with one image): written as the clip's override. */
+export interface StagePictureActions {
+  /** The project's pictures, by their place in the project, each with where its thumbnail is read from. */
+  pictures(): Array<{ path: string; name: string; url?: string }>;
+  /** One from this computer, brought into the project: its place there (null: none picked). */
+  pickFromComputer?(): Promise<string | null>;
+  /** `path` (in the project) drawn in the layer's place; null: its own again. */
+  put(element: StageElement, path: string | null): void;
+}
+
+/** A picture's thumbnail in a menu, where its icon goes: wider than an icon, so the pictures read apart. */
+export function pictureThumb(url: string | undefined): React.ReactNode {
+  return url
+    ? <img src={url} alt="" draggable={false} loading="lazy" className="h-[14px] w-[22px] shrink-0 rounded-[2px] object-cover" />
+    : <ImageIcon size={14} />;
+}
+
+/** The pictures a layer's Replace offers: the project's, one from this computer, and its own again once replaced. */
+export function replacePictureEntries(el: StageElement, actions: StagePictureActions, t: (path: string) => string): ContextMenuEntry[] {
+  const picture = el.picture;
+  if (!picture) return [];
+  const list = actions.pictures().slice(0, 40);
+  const pick = actions.pickFromComputer;
+  const out: ContextMenuEntry[] = list.map((f) => ({ id: `picture:${f.path}`, label: f.name, icon: pictureThumb(f.url), onSelect: () => actions.put(el, f.path) }));
+  if (pick) {
+    if (out.length) out.push({ id: 'picture-sep', separator: true });
+    out.push({
+      id: 'picture-computer', label: t('inspector.templatePictureComputer'), icon: <HardDriveUpload size={14} />,
+      onSelect: () => { void pick().then((path) => { if (path) actions.put(el, path); }); },
+    });
+  }
+  if (picture.changed) {
+    out.push({ id: 'picture-own-sep', separator: true });
+    out.push({ id: 'picture-own', label: t('stageMenu.pictureOwn'), icon: <RotateCcw size={14} />, onSelect: () => actions.put(el, null) });
+  }
+  return out;
 }
 
 type T = (path: string) => string;
@@ -97,6 +151,28 @@ function list() {
   };
 }
 
+/** Copy and Paste for layers: the layers copied, and what was copied last (layers or clips) pasted over their clip. */
+function copyPasteEntries(
+  layers: readonly StageElement[],
+  actions: { copyLayers?: StageMenuActions['copyLayers']; clip?: Pick<StageClipActions, 'isLocked' | 'canPaste' | 'paste'> },
+  t: T,
+): ContextMenuEntry[] {
+  const copy = actions.copyLayers;
+  const clip = actions.clip;
+  const clipLoc = layers[0]?.clipLoc;
+  const out: ContextMenuEntry[] = [];
+  if (copy) out.push({ id: 'copy-layers', label: t('timeline.menuCopy'), icon: <CopyIcon size={14} />, shortcut: hintOf(currentKeymap(), 'copy', MAC), onSelect: () => copy(layers) });
+  if (clip && clipLoc) {
+    const trackLocked = clip.isLocked(clipLoc);
+    out.push({
+      id: 'paste-layers', label: t('timeline.menuPaste'), icon: <ClipboardPaste size={14} />, shortcut: hintOf(currentKeymap(), 'paste', MAC),
+      disabled: trackLocked || !clip.canPaste(), hint: trackLocked ? t('timeline.trackLocked') : t('timeline.menuPasteEmpty'),
+      onSelect: () => clip.paste(clipLoc),
+    });
+  }
+  return out;
+}
+
 export function stageMenu(el: StageElement, ctx: StageMenuContext, actions: StageMenuActions, t: T): readonly ContextMenuEntry[] {
   const m = list();
   const lockKeys = shortcutHint('L', { mod: true, shift: true });
@@ -109,12 +185,20 @@ export function stageMenu(el: StageElement, ctx: StageMenuContext, actions: Stag
     const allLocked = many.every((x) => x.override?.lock);
     if (ctx.align) {
       const align = ctx.align;
+      const distribute = ctx.distribute;
       m.push({
         id: 'align', label: t('stageMenu.align'), icon: <Layers size={14} />,
-        submenu: ([
-          ['left', 'inspector.alignLeft'], ['hcenter', 'inspector.alignHCenter'], ['right', 'inspector.alignRight'],
-          ['top', 'inspector.alignTop'], ['vcenter', 'inspector.alignVCenter'], ['bottom', 'inspector.alignBottom'],
-        ] as const).map(([edge, key]) => ({ id: `align-${edge}`, label: t(key), onSelect: () => align(edge) })),
+        submenu: [
+          ...([
+            ['left', 'inspector.alignLeft'], ['hcenter', 'inspector.alignHCenter'], ['right', 'inspector.alignRight'],
+            ['top', 'inspector.alignTop'], ['vcenter', 'inspector.alignVCenter'], ['bottom', 'inspector.alignBottom'],
+          ] as const).map(([edge, key]) => ({ id: `align-${edge}`, label: t(key), onSelect: () => align(edge) })),
+          ...(distribute ? [
+            { id: 'distribute-sep', separator: true } as const,
+            { id: 'distribute-x', label: t('inspector.distributeH'), onSelect: () => distribute('x') },
+            { id: 'distribute-y', label: t('inspector.distributeV'), onSelect: () => distribute('y') },
+          ] : []),
+        ],
       });
     }
     m.push({
@@ -125,6 +209,17 @@ export function stageMenu(el: StageElement, ctx: StageMenuContext, actions: Stag
       id: 'lock', label: allLocked ? t('stageMenu.unlock') : t('stageMenu.lock'), icon: allLocked ? <Unlock size={14} /> : <Lock size={14} />, shortcut: lockKeys,
       onSelect: () => actions.editOverrides(many.map((x) => ({ element: x, patch: { lock: !allLocked } }))),
     });
+    m.sep();
+    for (const entry of copyPasteEntries(many, actions, t)) m.push(entry);
+    const deleteLayers = actions.deleteLayers;
+    if (deleteLayers) {
+      m.sep();
+      const anyLocked = many.some((x) => x.override?.lock);
+      m.push({
+        id: 'delete', label: t('timeline.removeBlock'), icon: <Trash2 size={14} />, danger: true, shortcut: hintOf(currentKeymap(), 'remove', MAC),
+        disabled: anyLocked, hint: t('stageMenu.lockedHint'), onSelect: () => deleteLayers(many),
+      });
+    }
     return m.done();
   }
 
@@ -149,6 +244,9 @@ export function stageMenu(el: StageElement, ctx: StageMenuContext, actions: Stag
     });
     m.push({ id: 'duplicate', label: t('stageMenu.duplicate'), icon: <CopyPlus size={14} />, disabled: trackLocked, hint: lockedHint, onSelect: () => clip.duplicate(clipLoc) });
     m.sep();
+    if (ctx.crop) m.push({ id: 'crop', label: t('stageMenu.crop'), icon: <CropIcon size={14} />, shortcut: 'C', disabled: trackLocked, hint: lockedHint, onSelect: ctx.crop });
+    if (ctx.mask) m.push({ id: 'mask', label: t('stageMenu.mask'), icon: <SquareDashed size={14} />, disabled: trackLocked, hint: lockedHint, submenu: ctx.mask });
+    m.sep();
     m.push({ id: 'front', label: t('stageMenu.front'), icon: <BringToFront size={14} />, disabled: trackLocked, hint: lockedHint, onSelect: () => clip.bringToFront(clipLoc) });
     m.push({ id: 'back', label: t('stageMenu.back'), icon: <SendToBack size={14} />, disabled: trackLocked, hint: lockedHint, onSelect: () => clip.sendToBack(clipLoc) });
     m.push({ id: 'reset', label: t('stageMenu.resetTransform'), icon: <RotateCcw size={14} />, disabled: trackLocked, hint: lockedHint, onSelect: () => clip.resetTransform(clipLoc) });
@@ -158,7 +256,7 @@ export function stageMenu(el: StageElement, ctx: StageMenuContext, actions: Stag
       m.push({ id: 'export', label: t('timeline.menuExportClip'), icon: <Download size={14} />, onSelect: () => exportClip(id) });
     }
     m.sep();
-    m.push({ id: 'delete', label: t('timeline.removeBlock'), icon: <Trash2 size={14} />, danger: true, shortcut: '⌫', disabled: trackLocked, hint: lockedHint, onSelect: () => clip.remove(clipLoc) });
+    m.push({ id: 'delete', label: t('timeline.removeBlock'), icon: <Trash2 size={14} />, danger: true, shortcut: hintOf(currentKeymap(), 'remove', MAC), disabled: trackLocked, hint: lockedHint, onSelect: () => clip.remove(clipLoc) });
     return m.done();
   }
 
@@ -169,6 +267,9 @@ export function stageMenu(el: StageElement, ctx: StageMenuContext, actions: Stag
   const adjusted = Boolean(o && (o.t || o.s != null || o.r || o.text != null || (o.style && Object.keys(o.style).length)));
   if (ctx.editText) {
     m.push({ id: 'edit-text', label: t('stageMenu.editText'), icon: <TypeIcon size={14} />, shortcut: '↵', disabled: locked, hint: t('stageMenu.lockedHint'), onSelect: ctx.editText });
+  }
+  if (el.picture && actions.picture) {
+    m.push({ id: 'replace-picture', label: t('stageMenu.replacePicture'), icon: <ImageUp size={14} />, disabled: locked, hint: t('stageMenu.lockedHint'), submenu: replacePictureEntries(el, actions.picture, t) });
   }
   m.sep();
   /* restacking writes z-index overrides where the layer meets what it overlaps (stage.js arrange), in one write; the
@@ -211,7 +312,17 @@ export function stageMenu(el: StageElement, ctx: StageMenuContext, actions: Stag
   const clipLoc = el.clipLoc;
   if (clipLoc) m.push({ id: 'clip', label: t('stageMenu.selectClip'), icon: <Layers size={14} />, onSelect: () => actions.selectClip(clipLoc) });
   const words = el.text?.value;
+  m.sep();
+  for (const entry of copyPasteEntries([el], actions, t)) m.push(entry);
   if (words) m.push({ id: 'copy-text', label: t('stageMenu.copyText'), icon: <CopyIcon size={14} />, onSelect: () => { void navigator.clipboard?.writeText(words).catch(() => {}); } });
+  const deleteLayers = actions.deleteLayers;
+  if (deleteLayers) {
+    m.sep();
+    m.push({
+      id: 'delete', label: t('timeline.removeBlock'), icon: <Trash2 size={14} />, danger: true, shortcut: hintOf(currentKeymap(), 'remove', MAC),
+      disabled: locked, hint: t('stageMenu.lockedHint'), onSelect: () => deleteLayers([el]),
+    });
+  }
   return m.done();
 }
 

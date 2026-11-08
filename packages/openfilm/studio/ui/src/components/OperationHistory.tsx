@@ -12,7 +12,8 @@ import React from 'react';
 import { createPortal } from 'react-dom';
 import { User } from 'lucide-react';
 import { useT } from '@/i18n';
-import { shortcutHint } from '@/lib/shortcut-hint';
+import { hintOf } from '@/lib/keymap';
+import { currentKeymap, MAC } from '@/lib/keymap-store';
 
 /** One step of the session. */
 export interface SessionOp {
@@ -38,7 +39,7 @@ const FLAG_STEP = {
 
 /**
  * The label of a track toggle, by what was done to which track: `Locked V1`, `Muted A1`. `track` is the badge the
- * timeline shows (P1 / V1 / A1).
+ * timeline shows (V1 / A1).
  */
 export function trackFlagStep(flag: keyof typeof FLAG_STEP, on: boolean, track: string): string {
   return `${FLAG_STEP[flag][on ? 0 : 1]}|${track}`;
@@ -112,7 +113,7 @@ export function OperationHistory({
       ref={panel}
       role="dialog"
       aria-label={t('history.opsTitle')}
-      className="fixed z-[120] flex flex-col overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] shadow-[var(--shadow-lg)]"
+      className="fixed z-[120] flex flex-col overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-raised)] shadow-[var(--shadow-lg)]"
       style={{
         left,
         top: anchor.bottom + 6,
@@ -160,7 +161,7 @@ function OpRow({
   t: (key: string) => string;
   onPick: () => void;
 }) {
-  const tone = undone ? 'text-[var(--text-faint)]' : 'text-[var(--text-dim)]';
+  const tone = undone ? 'text-[var(--text-faint)]' : 'text-[var(--text-muted)]';
   return (
     <li>
       <button
@@ -174,7 +175,7 @@ function OpRow({
         </span>
         {next ? (
           <span className="shrink-0 rounded-full bg-[var(--accent)]/15 px-1.5 py-px text-[10px] font-medium text-[var(--accent)]">
-            {shortcutHint('Z', { mod: true })}
+            {hintOf(currentKeymap(), 'undo', MAC)}
           </span>
         ) : null}
       </button>

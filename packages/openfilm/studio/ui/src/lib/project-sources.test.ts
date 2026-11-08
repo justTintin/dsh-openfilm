@@ -2,8 +2,81 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   SourceError, createSpeedMeter, examplesCollapsed, fetchErrorKey, followFetch, formatBytes, formatSeconds, looksLikeRepoUrl,
-  pathCrumbs, secondsLeft, setExamplesCollapsed, type FetchJob,
+  pathCrumbs, secondsLeft, setExamplesCollapsed, seenSkills, sourcesApi, type FetchJob,
+  SKILLS_CHANGED, watchSkills, type SkillEntry,
 } from './project-sources.ts';
+
+test('cover edits update cached personal skills, preserve project overrides, and retain state on failure', async (t) => {
+  const mine = { uid: 'local/cover-edit', name: 'cover-edit', description: '', source: 'mine', scripts: 0, cover: '/old.png' };
+  const project = { ...mine, uid: 'project/cover-edit', source: 'project' };
+  const requests: Array<{ path: string; method: string; body?: string }> = [];
+  t.mock.method(globalThis, 'fetch', async (path: string, opts: RequestInit = {}) => {
+    requests.push({ path, method: String(opts.method ?? 'GET'), body: opts.body as string | undefined });
+    if (opts.method === 'PUT') return new Response(JSON.stringify({ cover: '/new.png' }));
+    if (opts.method === 'DELETE') return new Response(JSON.stringify({ cover: null }));
+    return new Response(JSON.stringify({ skills: path.includes('override') ? [project] : [mine] }));
+  });
+  await sourcesApi.skills('personal');
+  await sourcesApi.skills('override');
+  assert.equal(await sourcesApi.setSkillCover(mine.uid, 'data:image/png;base64,test', 'personal'), '/new.png');
+  assert.deepEqual(requests.at(-1), { path: '/api/skills/local%2Fcover-edit/cover?project=personal', method: 'PUT', body: '{"cover":"data:image/png;base64,test"}' });
+  assert.equal(seenSkills('personal')?.[0]?.cover, '/new.png');
+  assert.equal(seenSkills('override')?.[0]?.cover, '/old.png');
+  t.mock.method(globalThis, 'fetch', async () => new Response('{"error":"not saved"}', { status: 400 }));
+  await assert.rejects(sourcesApi.setSkillCover(mine.uid, null, 'personal'), /not saved/);
+  assert.equal(seenSkills('personal')?.[0]?.cover, '/new.png');
+  t.mock.restoreAll();
+  t.mock.method(globalThis, 'fetch', async (_path: string, opts: RequestInit) => {
+    assert.equal(opts.method, 'DELETE');
+    assert.equal(opts.body, undefined);
+    return new Response('{"cover":null}');
+  });
+  assert.equal(await sourcesApi.setSkillCover(mine.uid, null, 'personal'), null);
+  assert.equal(seenSkills('personal')?.[0]?.cover, undefined);
+});
+
+test('an open skills gallery reloads the current project after an addition and stops when closed', async (t) => {
+  const events = new EventTarget();
+  const lists: SkillEntry[][] = [];
+  const paths: string[] = [];
+  let skills: SkillEntry[] = [];
+  t.mock.method(globalThis, 'fetch', async (path: string) => {
+    paths.push(path);
+    return new Response(JSON.stringify({ skills }));
+  });
+  const stop = watchSkills('film 1', (list) => lists.push(list), events);
+  await new Promise(setImmediate);
+  assert.deepEqual(lists, [[]]);
+  skills = [{ name: 'new-skill', description: 'Added', source: 'mine', scripts: 0 }];
+  events.dispatchEvent(new Event(SKILLS_CHANGED));
+  await new Promise(setImmediate);
+  assert.deepEqual(lists.at(-1), skills);
+  assert.deepEqual(paths, ['/api/skills?project=film%201', '/api/skills?project=film%201']);
+  stop();
+  events.dispatchEvent(new Event(SKILLS_CHANGED));
+  await new Promise(setImmediate);
+  assert.equal(paths.length, 2);
+});
+
+test('a pre-addition request or closed gallery cannot publish a stale list', async (t) => {
+  const events = new EventTarget();
+  const pending: Array<(response: Response) => void> = [];
+  t.mock.method(globalThis, 'fetch', () => new Promise<Response>((resolve) => pending.push(resolve)));
+  const lists: SkillEntry[][] = [];
+  const stop = watchSkills(null, (list) => lists.push(list), events);
+  events.dispatchEvent(new Event(SKILLS_CHANGED));
+  const added: SkillEntry[] = [{ name: 'added', description: '', source: 'mine', scripts: 0 }];
+  pending[1]!(new Response(JSON.stringify({ skills: added })));
+  await new Promise(setImmediate);
+  pending[0]!(new Response(JSON.stringify({ skills: [] })));
+  await new Promise(setImmediate);
+  assert.deepEqual(lists, [added]);
+  events.dispatchEvent(new Event(SKILLS_CHANGED));
+  stop();
+  pending[2]!(new Response(JSON.stringify({ skills: [] })));
+  await new Promise(setImmediate);
+  assert.deepEqual(lists, [added]);
+});
 
 test('what looks like a repository address enables "Get"', () => {
   assert.ok(looksLikeRepoUrl('https://github.com/openfilm/examples/tree/main/one-prompt'));

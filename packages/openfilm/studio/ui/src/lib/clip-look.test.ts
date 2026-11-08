@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   adjustOf, cropCss, cropForRatio, cropOf, cropRatio, declared, fadeCss, fadeOf, framingCss, framingOf, ownedDeclaration, shadowOf,
-  backdropBlurCss, backdropBlurOf, innerShadowCss, innerShadowOf, placedStrokeCss, placedStrokeOf, radiusCorners, strokeCss, strokeOf, withAdjust, withDeclarations, withShadow,
+  backdropBlurCss, backdropBlurOf, innerShadowCss, innerShadowOf, placedStrokeCss, placedStrokeOf, radiusCorners, strokeCss, strokeOf, textColorCss, textColorOf, withAdjust, withDeclarations, withShadow,
 } from './clip-look.ts';
 
 test('a clip\'s own CSS: each control writes its properties, the rest stays as it was', () => {
@@ -94,7 +94,7 @@ test('what the controls say is left out of the raw CSS', () => {
   assert.ok(ownedDeclaration('mask-image', 'linear-gradient(to right, transparent, #000 15%)', none));
 });
 
-test('a stroke lies inside, across or outside the edge, as Figma\'s: an outline and its offset', () => {
+test('a stroke lies inside, across or outside the edge: an outline and its offset', () => {
   const read = (css: Record<string, string>) => (prop: string) => css[prop];
   assert.deepEqual(placedStrokeOf(read({ outline: 'rgb(255, 255, 255) solid 4px', 'outline-offset': '-4px' })), { width: 4, style: 'solid', color: 'rgb(255, 255, 255)', position: 'inside' });
   assert.equal(placedStrokeOf(read({ outline: '#fff solid 4px', 'outline-offset': '-2px' }))?.position, 'center');
@@ -129,4 +129,20 @@ test('corners from the border-radius shorthand: one to four lengths, filled in a
   assert.deepEqual(radiusCorners('4px 20px 8px'), [4, 20, 8, 20]);
   assert.deepEqual(radiusCorners('4px 20px 20px 20px'), [4, 20, 20, 20]);
   assert.deepEqual(radiusCorners('10px 5px / 2px'), [10, 5, 10, 5]);
+});
+
+test('words: the color they are drawn in, and a new one written over a fill of their page\'s own', () => {
+  const readOf = (style: Record<string, string>) => (prop: string) => style[prop];
+  const gold = readOf({ color: '#b39458', '-webkit-text-fill-color': '#c9a86a' });
+  assert.equal(textColorOf(gold), '#c9a86a', 'the fill is what shows');
+  assert.deepEqual(textColorCss(gold, '#a08b63'), { color: '#a08b63', '-webkit-text-fill-color': 'currentcolor' });
+  const plain = readOf({ color: '#ffffff' });
+  assert.equal(textColorOf(plain), '#ffffff');
+  assert.deepEqual(textColorCss(plain, '#a08b63'), { color: '#a08b63' }, 'no fill of its own: the color alone');
+  const taken = readOf({ color: '#a08b63', '-webkit-text-fill-color': 'currentcolor' });
+  assert.equal(textColorOf(taken), '#a08b63');
+  assert.deepEqual(textColorCss(taken, '#ff0000'), { color: '#ff0000' }, 'taken over once, only the color changes after');
+  const gradient = readOf({ color: '#ffffff', '-webkit-text-fill-color': '#00000000' });
+  assert.equal(textColorOf(gradient), '#ffffff', 'see-through words (a gradient behind them) show their color');
+  assert.deepEqual(textColorCss(gradient, '#a08b63'), { color: '#a08b63', '-webkit-text-fill-color': 'currentcolor' }, 'a color picked fills them');
 });

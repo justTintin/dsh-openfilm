@@ -6,14 +6,14 @@
  * wider pane or a taller timeline when working on a long edit. A fixed ratio always
  * shortchanges one of them, and only the user knows the trade-off at that moment.
  *
- * Modeled on Unreal: the gap between the panes is the seam, and the seam is the handle. Its
- * width must therefore equal the spacing between panes (DOCK_GAP); one pixel off makes it look crooked.
+ * The panes meet edge to edge, square, with a one-pixel line between them (DOCK_GAP); that line is the seam, and
+ * the seam is the handle. Its width must therefore equal the spacing between panes; one pixel off makes it look crooked.
  *
  * With a mouse the seam draws nothing. Hovering already turns the cursor into a resize arrow,
  * and while dragging the panes widen under the hand, which is the most direct feedback there
  * is. Lighting up a line would say the same thing a third time, and it would flicker whenever
  * the pointer merely crosses the seam (a seam between panes is on the path across the screen).
- * CapCut and Unreal work this way: the cursor says where you can drag, the content says what is happening.
+ * The cursor says where you can drag, the content says what is happening.
  *
  * It lights up only when reached by keyboard: there is no cursor shape and no held button
  * then, so without a highlight a keyboard user cannot tell which seam has focus.
@@ -23,10 +23,10 @@
  */
 import React from 'react';
 
-/** Gap between panes (px); the workspace's outer margin uses the same value so the seams line up. */
-export const DOCK_GAP = 6;
+/** The line between panes (px): the board under them (--dock-line) showing through. */
+export const DOCK_GAP = 1;
 
-/** A 6px seam is too thin to grab with a mouse, so the grab area is widened to 14px using negative margins, without taking layout space. */
+/** A 1px seam is too thin to grab with a mouse, so the grab area is widened to 14px using negative margins, without taking layout space. */
 const GRAB = 14;
 const BLEED = (GRAB - DOCK_GAP) / 2;
 
@@ -35,19 +35,19 @@ const BLEED = (GRAB - DOCK_GAP) / 2;
  * any narrower and the inputs pile on top of each other. The viewer keeps room for the
  * picture and its transport bar.
  */
-export const MIN_INSPECTOR = 240;
+export const MIN_INSPECTOR = 280;
 export const MIN_VIEWER = 280;
 
 /**
  * Default inspector width when first opened.
  *
- * The minimum (240) is the "any narrower and it breaks" line, not a comfortable width. Each
+ * The minimum (280) is the "any narrower and it breaks" line, not a comfortable width. Each
  * number field sits next to a label; narrower and the two columns get only a dozen or so
  * pixels each, and the font-name field collapses to an ellipsis. The first impression would be
  * a cramped column, and people do not think to drag it wider; they assume that is how the
  * panel looks. Users who have resized it are unaffected: usePaneSize stores their own value.
  */
-export const DEFAULT_INSPECTOR = 300;
+export const DEFAULT_INSPECTOR = 360;
 
 /**
  * Height limits for the pane below the viewer (the timeline).

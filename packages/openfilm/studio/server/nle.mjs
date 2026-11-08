@@ -10,25 +10,28 @@
  *     number for the cut, so there is never a one-frame gap.
  *   · Tracks reversed: film.html's first track is on top; xmeml's V1 is at the bottom. Clips overlapping on one track
  *     are spread over several (an editor's track shows one clip a frame).
- *   · A web page (a motion graphic) is always rendered: a full-frame ProRes 4444 with alpha, its placement in the
+ *   · A web page (a motion graphic) is always rendered: a full-frame MOV with alpha (`alpha`: ProRes 4444 or PNG;
+ *     footage with alpha that has to be converted is written the same way), its placement in the
  *     picture. Footage and stills come as they are, placed with Basic Motion (uniform scale and a move); what Basic
  *     Motion can't say (a rotation, a speed change, an unknown size) is rendered too: rather less to adjust than a
  *     picture in the wrong place.
  *   · Sound comes as clips (each its own, with its level, footage's sound linked to its picture) on footage, voice,
- *     sound-effect and music tracks, or as those four mixed stems.
+ *     sound-effect and music tracks, or as those four mixed stems. FCPXML clips instead retain their source rows.
  *   · A hidden track's clips and a muted track's sounds are not dropped: they come disabled, one click from back on.
  *   · Fades (film.html `overrides`' `fade`): a picture that fades is rendered, its fades in its alpha; a sound that
  *     fades comes as a WAV of its own part, from its first frame, with Audio Levels keyframes for its ramps (counted
  *     from the file's start, which is the clip's, so editors that count keyframes from either agree).
  */
 import { spawn } from 'node:child_process';
+import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { clipKind, pictureRect, soundRole } from '../../src/film-doc.mjs';
+import { exactRate } from '../../src/rate.mjs';
 
 /**
  * @typedef {import('../../src/film-doc.mjs').FilmBox} FilmBox
  * @typedef {{ w?: number, h?: number, duration?: number, fps?: number, hasVideo?: boolean, hasAudio?: boolean,
- *   channels?: number, sampleRate?: number, alpha?: boolean }} SourceFacts
+ *   channels?: number, sampleRate?: number, alpha?: boolean, timecode?: NleTimecode }} SourceFacts
  * @typedef {{ id: string, kind: 'page' | 'video' | 'still', src: string, path: string, at: number, end: number,
  *   from: number, speed: number, box?: FilmBox, track: number, hidden: boolean, styled?: boolean, faded?: boolean,
  *   facts: SourceFacts | null }} NlePicture
@@ -37,29 +40,31 @@ import { clipKind, pictureRect, soundRole } from '../../src/film-doc.mjs';
  * @typedef {'voice' | 'music' | 'sfx' | 'footage'} SoundRole
  *   A sound's stem (see soundStem)
  * @typedef {{ id: string, src: string, path: string, at: number, from: number, to: number, speed: number, volume: number,
- *   enabled: boolean, role: SoundRole, picture?: string, facts: SourceFacts | null, fade?: [number, number] }} NleSound
+ *   enabled: boolean, role: SoundRole, track?: number, sourceRow?: string, picture?: string, facts: SourceFacts | null, fade?: [number, number] }} NleSound
  *   A sound: the source seconds [from, to) at `speed`, placed at film second `at`; `picture`: the footage clip it is
  *   the sound of; `fade`: its fades in and out, film seconds (fitted to its length)
  * @typedef {{ stage: { w: number, h: number }, duration: number, pictures: NlePicture[], sounds: NleSound[] }} NleFilm
  * @typedef {{ title: string, fps: number, audio: 'clips' | 'stems', media: 'copy' | 'link', mediaDir: string,
- *   stems?: SoundRole[] }} NlePlanOptions
+ *   stems?: SoundRole[], audioTracks?: 'roles' | 'source', alpha?: NleAlpha }} NlePlanOptions
+ * @typedef {'png' | 'prores4444'} NleAlpha How a picture with alpha is written, in a MOV (default ProRes 4444)
  * @typedef {{ timebase: number, ntsc: boolean, fps: number }} NleRate
+ * @typedef {{ value: string, rate: NleRate }} NleTimecode
  * @typedef {{ kind: 'render', clip: string, frames: number }
  *   | { kind: 'copy', from: string }
  *   | { kind: 'link', from: string }
  *   | { kind: 'raster', from: string, src: string, w: number, h: number }
- *   | { kind: 'transcode', from: string, to: 'prores422hq' | 'prores4444' | 'wav', segment?: { from: number, to: number, speed: number, seconds: number } }
+ *   | { kind: 'transcode', from: string, to: 'prores422hq' | NleAlpha | 'wav', segment?: { from: number, to: number, speed: number, seconds: number } }
  *   | { kind: 'stem', role: SoundRole }} NleMediaJob
  *   How a file is made: a clip rendered, a source cloned or pointed at, a still drawn to PNG, a source converted
  *   (`segment`: only those source seconds, at that speed, `seconds` long), a mixed stem
  * @typedef {{ id: string, name: string, path: string, job: NleMediaJob, durationFrames: number,
- *   video?: { w: number, h: number, alpha: boolean, still: boolean }, audio?: { channels: number, sampleRate: number } }} NleFile
+ *   video?: { w: number, h: number, alpha: boolean, still: boolean, fps?: number }, audio?: { channels: number, sampleRate: number }, timecode?: NleTimecode }} NleFile
  * @typedef {{ id: string, name: string, fileId: string, start: number, end: number, in: number, out: number, enabled: boolean,
  *   motion?: { scale: number, center: { h: number, v: number } }, gain?: number,
- *   levels?: { when: number, value: number }[], linkGroup?: string }} NleClip
+ *   levels?: { when: number, value: number }[], linkGroup?: string, sourceRow?: string }} NleClip
  *   Sequence frames [start, end), file frames [in, out); `gain` linear; `levels` its gain's keyframes (its fades),
  *   frames from the clip's first
- * @typedef {{ name: string, enabled: boolean, clips: NleClip[] }} NleTrack
+ * @typedef {{ name: string, enabled: boolean, clips: NleClip[], sourceTrack?: number, role?: SoundRole }} NleTrack
  * @typedef {{ name: string, rate: NleRate, width: number, height: number, durationFrames: number, video: NleTrack[],
  *   audio: NleTrack[], files: NleFile[] }} NleTimeline
  */
@@ -73,8 +78,22 @@ export const nleFps = (fps) => NLE_FPS.reduce((best, f) => (Math.abs(f - fps) < 
 /** 29.97 / 59.94 / 23.976 → ntsc (a whole timebase, the true rate ×1000/1001). @param {number} fps @returns {NleRate} */
 export function nleRate(fps) {
   const base = Math.max(1, Math.round(fps));
-  const ntsc = Math.abs(fps - base) > 0.001 && Math.abs(fps - (base * 1000) / 1001) < 0.01;
+  const ntsc = exactRate(fps).den === 1001;
   return ntsc ? { timebase: base, ntsc: true, fps: (base * 1000) / 1001 } : { timebase: base, ntsc: false, fps: base };
+}
+
+/** A source's SMPTE address, only when its label and rate agree. @param {string | undefined} raw @param {number | undefined} fps @returns {NleTimecode | undefined} */
+export function sourceTimecode(raw, fps) {
+  const parts = /^(\d{2}):([0-5]\d):([0-5]\d)([:;.])(\d{2,3})$/.exec(raw ?? '');
+  if (!parts || !fps || fps <= 0 || fps >= 500) return;
+  const rate = nleRate(fps);
+  if (Math.abs(rate.fps - fps) > 0.001) return;
+  const hours = Number(parts[1]), minutes = Number(parts[2]), seconds = Number(parts[3]), frames = Number(parts[5]);
+  if (hours >= 24 || frames >= rate.timebase) return;
+  const drop = parts[4] !== ':';
+  if (drop && (!rate.ntsc || ![30, 60].includes(rate.timebase)
+    || (minutes % 10 !== 0 && seconds === 0 && frames < rate.timebase / 15))) return;
+  return { value: parts[0].replace('.', ';'), rate };
 }
 
 /** Seconds → sequence frames. @param {number} sec @param {NleRate} rate */
@@ -148,12 +167,27 @@ const ROLE_NAME = { footage: 'Footage', voice: 'Voice', sfx: 'SFX', music: 'Musi
 const safeStem = (/** @type {string} */ name) => name.replace(/[\\/:*?"<>|\u0000-\u001f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80) || 'clip';
 const stemOf = (/** @type {string} */ src) => (src.split('/').pop() ?? src).replace(/\.[^.]+$/, '');
 
+/** Stable source-row identity, independent of file names and export formats.
+ * @param {readonly NleSound[]} sounds
+ */
+function sourceAudioGroups(sounds) {
+  const tracks = new Set();
+  for (const sound of sounds) {
+    if (sound.track === undefined) throw new Error(`audio clip ${sound.id} has no source track`);
+    tracks.add(sound.track);
+  }
+  return [...tracks].sort((a, b) => a - b)
+    .map((track, i) => ({ key: `track-${track}`, name: `A${i + 1}`, sourceTrack: track }));
+}
+
 /**
  * The timeline, planned: tracks, each clip's frames, the file each points at and how that file is made.
+ * Audio clips group by role by default; `audioTracks: 'source'` retains source rows and requires their indices.
  * @param {NleFilm} film @param {NlePlanOptions} opts @returns {NleTimeline}
  */
 export function planNleTimeline(film, opts) {
   const rate = nleRate(opts.fps);
+  const sourceTracks = opts.audioTracks === 'source';
   const { stage } = film;
   /** @type {NleFile[]} */
   const files = [];
@@ -163,11 +197,15 @@ export function planNleTimeline(film, opts) {
   let fileSeq = 0, clipSeq = 0;
   const total = Math.max(1, toFrame(film.duration, rate));
 
+  /* one name to a disk that takes upper and lower case, or a letter written whole or as letter and accent (macOS:
+     `café` NFC and NFD), as the same: two such files would be one */
+  const sameOnDisk = (/** @type {string} */ name) => name.toLowerCase().normalize('NFC');
   const mediaPath = (/** @type {string} */ stem, /** @type {string} */ ext) => {
     let name = `${safeStem(stem)}.${ext}`;
-    for (let n = 2; names.has(name.toLowerCase()); n++) name = `${safeStem(stem)} (${n}).${ext}`;
-    names.add(name.toLowerCase());
-    return { name, path: `${opts.mediaDir.replace(/\/$/, '')}/${name}` };
+    for (let n = 2; names.has(sameOnDisk(name)); n++) name = `${safeStem(stem)} (${n}).${ext}`;
+    names.add(sameOnDisk(name));
+    /* the system's own separators: a draft on Windows names its files with backslashes, as 剪映 does */
+    return { name, path: join(opts.mediaDir, name) };
   };
   const addFile = (/** @type {Omit<NleFile, 'id'>} */ f) => { const file = { id: `file-${++fileSeq}`, ...f }; files.push(file); return file; };
   const clipId = () => `clipitem-${++clipSeq}`;
@@ -201,15 +239,16 @@ export function planNleTimeline(film, opts) {
       const video = want === 'video' ? facts.hasVideo !== false : facts.hasVideo === true;
       const audio = facts.hasAudio ? { channels: facts.channels ?? 2, sampleRate: facts.sampleRate ?? 48_000 } : undefined;
       let made;
-      if (video && VIDEO_CONVERT.has(ext)) made = { ...mediaPath(stem, 'mov'), job: /** @type {NleMediaJob} */ ({ kind: 'transcode', from: s.path, to: facts.alpha ? 'prores4444' : 'prores422hq' }) };
+      if (video && VIDEO_CONVERT.has(ext)) made = { ...mediaPath(stem, 'mov'), job: /** @type {NleMediaJob} */ ({ kind: 'transcode', from: s.path, to: facts.alpha ? opts.alpha ?? 'prores4444' : 'prores422hq' }) };
       else if (!video && !AUDIO_COPY.has(ext)) made = { ...mediaPath(stem, 'wav'), job: /** @type {NleMediaJob} */ ({ kind: 'transcode', from: s.path, to: 'wav' }) };
       else made = original();
       const converted = made.job.kind === 'transcode';
       file = addFile({
         ...made,
         durationFrames: facts.duration ? Math.max(1, toFrame(facts.duration, rate)) : Math.max(1, minFrames),
-        ...(video ? { video: { w: facts.w ?? stage.w, h: facts.h ?? stage.h, alpha: Boolean(facts.alpha), still: false } } : {}),
+        ...(video ? { video: { w: facts.w ?? stage.w, h: facts.h ?? stage.h, alpha: Boolean(facts.alpha), still: false, fps: facts.fps } } : {}),
         ...(audio ? { audio: converted ? { channels: audio.channels, sampleRate: 48_000 } : audio } : {}),
+        ...(!converted && facts.timecode ? { timecode: facts.timecode } : {}),
       });
       if (facts.duration) measured.add(file.id);
     }
@@ -227,9 +266,10 @@ export function planNleTimeline(film, opts) {
     const span = frameSpan(p.at, p.end, rate);
     const len = span.end - span.start;
     if (len <= 0) continue;
+    const link = sourceTracks && p.kind === 'video' ? { linkGroup: `footage-${p.id}` } : {};
     const bake = () => {
       const file = addFile({ ...mediaPath(p.id, 'mov'), job: { kind: 'render', clip: p.id, frames: len }, durationFrames: len, video: { w: stage.w, h: stage.h, alpha: true, still: false } });
-      visual.push({ track: p.track, ...span, clip: { id: clipId(), name: p.id, fileId: file.id, ...span, in: 0, out: len, enabled: !p.hidden } });
+      visual.push({ track: p.track, ...span, clip: { id: clipId(), name: p.id, fileId: file.id, ...span, in: 0, out: len, enabled: !p.hidden, ...link } });
     };
     /* a clip with a look of its own (the film's CSS: a crop, round corners) is drawn as the film draws it */
     if (p.kind === 'page' || p.styled || p.faded || !p.facts || (p.kind === 'video' && Math.abs(p.speed - 1) > 1e-6)) { bake(); continue; }
@@ -242,6 +282,7 @@ export function planNleTimeline(film, opts) {
     /** @type {NleClip} */
     const clip = {
       id: clipId(), name: p.id, fileId: file.id, start: span.start, end: span.start + out - inFrame, in: inFrame, out, enabled: !p.hidden,
+      ...link,
       ...(placement.kind === 'motion' ? { motion: placement.motion } : {}),
     };
     if (p.kind === 'video') footage.set(p.id, { clip, file, picture: p });
@@ -266,11 +307,15 @@ export function planNleTimeline(film, opts) {
     for (const role of ROLE_ORDER) {
       if (!opts.stems?.includes(role)) continue;
       const file = addFile({ ...mediaPath(`${opts.title || 'Film'} - ${role}`, 'wav'), job: { kind: 'stem', role }, durationFrames: total, audio: { channels: 2, sampleRate: 48_000 } });
-      audio.push({ name: ROLE_NAME[role], enabled: true, clips: [{ id: clipId(), name: `${ROLE_NAME[role]} stem`, fileId: file.id, start: 0, end: total, in: 0, out: total, enabled: true }] });
+      audio.push({ name: ROLE_NAME[role], enabled: true, role, clips: [{ id: clipId(), name: `${ROLE_NAME[role]} stem`, fileId: file.id, start: 0, end: total, in: 0, out: total, enabled: true }] });
     }
   } else {
-    /** @type {Map<SoundRole, { start: number, end: number, clip: NleClip }[]>} */
-    const byRole = new Map();
+    /** @type {{ key: string, name: string, sourceTrack?: number }[]} */
+    const groups = sourceTracks
+      ? sourceAudioGroups(film.sounds)
+      : ROLE_ORDER.map((role) => ({ key: role, name: ROLE_NAME[role] }));
+    /** @type {Map<string, { start: number, end: number, clip: NleClip }[]>} */
+    const byGroup = new Map();
     for (const s of film.sounds) {
       const length = (s.to - s.from) / s.speed;
       if (!(length > 0)) continue;
@@ -306,25 +351,29 @@ export function planNleTimeline(film, opts) {
       const clip = {
         id: clipId(), name: s.id, fileId: file.id, start: span.start, end: span.start + out - inFrame, in: inFrame, out,
         enabled: s.enabled,
+        ...(sourceTracks && s.sourceRow ? { sourceRow: s.sourceRow } : {}),
         ...(Math.abs(s.volume - 1) > 1e-6 ? { gain: round6(Math.min(3.98109, s.volume)) } : {}),
       };
       if (faded && s.fade) clip.levels = fadeKeyframes(s.fade, out - inFrame, Math.min(3.98109, s.volume), rate);
-      if (own && linked) {
+      if (own && linked && !sourceTracks) {
         linked.clip.linkGroup = `link-${linked.clip.id}`;
         clip.linkGroup = linked.clip.linkGroup;
       }
-      const list = byRole.get(s.role) ?? [];
+      if (sourceTracks && s.picture) clip.linkGroup = `footage-${s.picture}`;
+      const group = sourceTracks ? `track-${s.track}` : s.role;
+      const list = byGroup.get(group) ?? [];
       list.push({ start: clip.start, end: clip.end, clip });
-      byRole.set(s.role, list);
+      byGroup.set(group, list);
     }
-    for (const role of ROLE_ORDER) {
-      const items = (byRole.get(role) ?? []).sort((a, b) => a.start - b.start);
+    for (const group of groups) {
+      const items = (byGroup.get(group.key) ?? []).sort((a, b) => a.start - b.start);
       if (!items.length) continue;
       const lanes = allocateLanes(items);
       const count = Math.max(0, ...lanes) + 1;
       for (let lane = 0; lane < count; lane++) {
         const clips = items.filter((_, i) => lanes[i] === lane).map((v) => v.clip);
-        audio.push({ name: count > 1 ? `${ROLE_NAME[role]} ${lane + 1}` : ROLE_NAME[role], enabled: clips.some((c) => c.enabled), clips });
+        audio.push({ name: count > 1 ? `${group.name} ${lane + 1}` : group.name, enabled: clips.some((c) => c.enabled), clips,
+          ...(group.sourceTrack !== undefined ? { sourceTrack: group.sourceTrack } : {}) });
       }
     }
   }
@@ -366,9 +415,12 @@ export const nlePathUrl = (path) => pathToFileURL(path).href.replace(/^file:\/\/
 const bool = (/** @type {boolean} */ v) => (v ? 'TRUE' : 'FALSE');
 const num = (/** @type {number} */ n) => String(round6(n));
 const rateXml = (/** @type {NleRate} */ rate, /** @type {string} */ pad) => `${pad}<rate>\n${pad}  <timebase>${rate.timebase}</timebase>\n${pad}  <ntsc>${bool(rate.ntsc)}</ntsc>\n${pad}</rate>`;
-const timecodeXml = (/** @type {NleRate} */ rate, /** @type {string} */ pad) => [
-  `${pad}<timecode>`, rateXml(rate, `${pad}  `), `${pad}  <string>00:00:00:00</string>`, `${pad}  <frame>0</frame>`,
-  `${pad}  <displayformat>NDF</displayformat>`, `${pad}</timecode>`,
+const timecodeXml = (/** @type {NleRate} */ rate, /** @type {string} */ pad, /** @type {NleTimecode | undefined} */ source = undefined) => [
+  `${pad}<timecode>`, rateXml(source?.rate ?? rate, `${pad}  `),
+  `${pad}  <string>${xmlEscape(source?.value ?? '00:00:00:00')}</string>`,
+  // xmeml accepts the string and its own rate without a second, potentially conflicting frame count.
+  ...(source ? [] : [`${pad}  <frame>0</frame>`]),
+  `${pad}  <displayformat>${source?.value.includes(';') ? 'DF' : 'NDF'}</displayformat>`, `${pad}</timecode>`,
 ].join('\n');
 
 /** @param {NleFile} file @param {NleRate} rate @param {string} pad */
@@ -379,7 +431,7 @@ function fileXml(file, rate, pad) {
     `${pad}  <pathurl>${xmlEscape(nlePathUrl(file.path))}</pathurl>`,
     rateXml(rate, `${pad}  `),
     `${pad}  <duration>${file.durationFrames}</duration>`,
-    timecodeXml(rate, `${pad}  `),
+    timecodeXml(rate, `${pad}  `, file.timecode),
     `${pad}  <media>`,
   ];
   if (file.video) {
@@ -502,14 +554,14 @@ export function xmemlDocument(timeline) {
 export function probeSource(path) {
   return new Promise((done) => {
     const proc = spawn('ffprobe', ['-v', 'error', '-show_entries',
-      'format=duration,format_name:stream=codec_type,width,height,avg_frame_rate,r_frame_rate,channels,sample_rate,pix_fmt:stream_tags=alpha_mode',
+      'format=duration,format_name:format_tags=timecode:stream=codec_type,width,height,avg_frame_rate,r_frame_rate,channels,sample_rate,pix_fmt:stream_tags=alpha_mode,timecode',
       '-of', 'json', path], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
     let out = '';
     proc.stdout.on('data', (c) => { out += c; });
     proc.on('error', () => done({}));
     proc.on('close', () => {
       try {
-        /** @type {{ format?: { duration?: string, format_name?: string }, streams?: { codec_type?: string, width?: number, height?: number, avg_frame_rate?: string, r_frame_rate?: string, channels?: number, sample_rate?: string, pix_fmt?: string, tags?: { alpha_mode?: string } }[] }} */
+        /** @type {{ format?: { duration?: string, format_name?: string, tags?: Record<string, string> }, streams?: { codec_type?: string, width?: number, height?: number, avg_frame_rate?: string, r_frame_rate?: string, channels?: number, sample_rate?: string, pix_fmt?: string, tags?: Record<string, string> }[] }} */
         const json = JSON.parse(out);
         const streams = json.streams ?? [];
         const v = streams.find((s) => s.codec_type === 'video');
@@ -518,11 +570,15 @@ export function probeSource(path) {
         const still = /image|png|mjpeg|jpeg|bmp|tiff/.test(json.format?.format_name ?? '');
         const fr = (/** @type {string | undefined} */ raw) => { const [n, d] = (raw ?? '').split('/').map(Number); return n && d ? n / d : undefined; };
         const fps = fr(v?.avg_frame_rate) ?? fr(v?.r_frame_rate);
+        const tagged = (/** @type {Record<string, string> | undefined} */ tags) => Object.entries(tags ?? {}).find(([key]) => key.toLowerCase() === 'timecode')?.[1];
+        const timecode = sourceTimecode(tagged(v?.tags) ?? tagged(json.format?.tags)
+          ?? tagged(streams.find((s) => s.codec_type === 'data' && tagged(s.tags))?.tags), fps);
         done({
           ...(v?.width ? { w: v.width } : {}),
           ...(v?.height ? { h: v.height } : {}),
           ...(Number.isFinite(sec) && sec > 0 && !still ? { duration: sec } : {}),
           ...(fps && fps < 500 && !still ? { fps } : {}),
+          ...(timecode && !still ? { timecode } : {}),
           hasVideo: Boolean(v),
           hasAudio: Boolean(a),
           ...(a?.channels ? { channels: a.channels } : {}),

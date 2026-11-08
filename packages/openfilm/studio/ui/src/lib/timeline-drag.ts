@@ -2,7 +2,7 @@
  * The arithmetic of dragging on the timeline: pixels to time, what to snap to, where to land.
  *
  * Kept apart because a drag is dozens of pointer moves and a wrong step in any of them only feels "a bit off"; as pure
- * functions they are easy to pin down. Following mature editors (OpenCut):
+ * functions they are easy to pin down:
  *   · a 5 px threshold: without one, clicking a clip is a zero-length drag that writes the same value back;
  *   · snapping measured in screen pixels, not milliseconds, so it feels the same at every zoom;
  *   · a clip never snaps to itself, or it could not move at all.
@@ -13,13 +13,11 @@ import { snapToFrame } from './timecode.ts';
 export const DRAG_THRESHOLD_PX = 5;
 
 /**
- * Whether a press `dx`, `dy` px along has become a drag. A move lifts in either direction (up to another row); a roll,
- * a slip and a slide past the threshold sideways, so a click on a cut is a click (its transitions), not a roll; a
- * trimmed edge follows at once.
+ * Whether a press `dx`, `dy` px along has become a drag. A move lifts past the threshold in either direction (up to
+ * another row), so a click on a clip is a click; a trimmed edge follows at once.
  */
-export function dragLifted(mode: 'move' | 'trim-start' | 'trim-end' | 'roll' | 'slip' | 'slide', dx: number, dy: number): boolean {
+export function dragLifted(mode: DragMode, dx: number, dy: number): boolean {
   if (mode === 'move') return Math.abs(dx) >= DRAG_THRESHOLD_PX || Math.abs(dy) >= DRAG_THRESHOLD_PX;
-  if (mode === 'roll' || mode === 'slip' || mode === 'slide') return Math.abs(dx) >= DRAG_THRESHOLD_PX;
   return Math.abs(dx) >= 1;
 }
 
@@ -438,7 +436,7 @@ export function marqueeHits(
  * Which track a dragged clip lands on.
  *
  * A track has no kind (SPEC): any clip goes on any track. Onto a row it goes to that row's track, whatever is on it
- * there: the edit mode decides what happens to what it lands on (an insert pushes it on, an overwrite cuts it out).
+ * there: the edit mode decides what happens where it lands (put down, a taken spot opens a track; an insert pushes on).
  * Above or below every row it opens a new track there, the one gesture that does. Clips never swap.
  */
 export type TrackDrop =
@@ -458,19 +456,18 @@ export interface DropLane {
   docIndex?: number;
   /** Nothing can be put on a locked track. */
   locked?: boolean;
+  /** A sound track (A): only sounds go on it, and sounds go on nothing else. */
+  sound?: boolean;
   /** What is taken on this film.html track besides the clips being dragged. Rows of one track share a docIndex. */
   occupied?: readonly { startMs: number; endMs: number }[];
 }
 
 /**
- * How a move is put down. The magnet decides (insert: it goes in between and what follows moves along; overwrite: it
- * covers what is there), ⌥ held the other way. But a clip let go onto another clip of its own track goes in between
- * with the magnet off too, as an editor's main track does: dropped on a neighbor it means "put it here", never "cut the
- * neighbor"; ⌥ still overwrites then. Let go in free room, it stays where it was put. `overlaps`: the clip, where it
- * would land (flush against a neighbor if it looks flush), covers part of another clip on its own track.
+ * How a move is put down: where it is let go, never cutting what is there (a taken spot opens a track beside it, see
+ * newTrackSide); with ⌥ held it goes in between and what follows moves along (an insert).
  */
-export function moveEditMode({ magnet, alt, overlaps }: { magnet: boolean; alt: boolean; overlaps: boolean }): 'insert' | 'overwrite' {
-  return (magnet || overlaps) !== alt ? 'insert' : 'overwrite';
+export function moveEditMode(alt: boolean): 'insert' | 'place' {
+  return alt ? 'insert' : 'place';
 }
 
 export function rangeOverlaps(
@@ -481,12 +478,12 @@ export function rangeOverlaps(
 }
 
 /**
- * Where a track that has to be opened goes: right after its source, one row down. The new track grew out of that one
- * (a copied page belongs next to its original), and badges count top to bottom, so inserting after renames no track
- * above — "my P1" stays P1.
+ * Where a track opened beside a taken one goes (film.html place): away from V1 and A1, the way the badges count
+ * (filmTrackBadges). A picture or page track opens right above it, so what is put there shows over what it was put
+ * on; a sound track right below it. Either way the track pointed at keeps its badge.
  */
-export function newTrackSide(fromDocIndex: number): number {
-  return fromDocIndex + 1;
+export function newTrackSide(docIndex: number, role?: string): number {
+  return role === 'audio' ? docIndex + 1 : docIndex;
 }
 
 /**
@@ -510,6 +507,8 @@ export function moveDestFor(
   sourceDocIndex: number | undefined,
   lanes: readonly DropLane[],
   hoverLane: number,
+  /** The clip moved is a sound (by default: whether the track it is on is a sound track). */
+  sound?: boolean,
 ): TrackDrop {
   if (sourceDocIndex == null) return { action: 'stay' };
   const onFilm = lanes.filter((lane) => lane.docIndex != null);
@@ -524,6 +523,9 @@ export function moveDestFor(
   if (!target || target.docIndex == null) return { action: 'refuse' };
   if (target.docIndex === sourceDocIndex) return { action: 'stay' };
   if (target.locked) return { action: 'refuse' };
+  /* a sound to a sound track, a picture to a picture track */
+  const home = lanes.find((lane) => lane.docIndex === sourceDocIndex);
+  if (Boolean(target.sound) !== (sound ?? Boolean(home?.sound))) return { action: 'refuse' };
   return { action: 'move', trackIndex: target.docIndex };
 }
 
@@ -534,6 +536,8 @@ export interface GroupMember {
   laneIndex: number;
   startMs: number;
   endMs: number;
+  /** A sound (by default: whether the track it is on is a sound track). */
+  sound?: boolean;
 }
 
 export interface GroupLaneShift {
@@ -551,9 +555,9 @@ export interface GroupLaneShift {
 /**
  * Where a selection moved up or down lands.
  *
- * One degree of freedom: the whole group moves the same number of rows, keeping the shape the user made (Premiere /
- * Resolve do the same). Only the rows asked for are tried. Any track takes any clip; a track a clip moves to must be
- * unlocked. What is already on a track where a clip lands is the edit mode's to settle (insert or overwrite); the
+ * One degree of freedom: the whole group moves the same number of rows, keeping the shape the user made. Only the
+ * rows asked for are tried. A track a clip moves to must be unlocked, and of its kind (a sound
+ * to a sound track, a picture to a picture track). What is already on a track where a clip lands is the edit mode's to settle (insert or overwrite); the
  * landings themselves may not overlap each other: clips on one track do not overlap (SPEC).
  */
 export function groupLaneShift(
@@ -581,6 +585,7 @@ function groupFitsAt(
     if (!lane || lane.docIndex == null) return null;
     const moved = lane.docIndex !== home?.docIndex;
     if (moved && lane.locked) return null;
+    if (moved && Boolean(lane.sound) !== (m.sound ?? Boolean(home?.sound))) return null;
     landed.push({ member: m, docIndex: lane.docIndex, moved });
   }
   /* landings may not overlap on one track (rows spread from one track share its index) */

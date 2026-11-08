@@ -5,8 +5,9 @@
  * clip turns a division into Infinity, a wrong ruler step only looks "a bit dense", a wrong track index shows the
  * wrong name on a row.
  */
+import { layerBlocks } from '../../../server/track-layout.mjs';
 import { clipSpan } from '../../../../src/film-doc.mjs';
-import { fileStem, filmTrackBadges, filmTrackKind, filmTrackPrefix, type FilmBox } from './film.ts';
+import { fileStem, filmSrcIsLibrary, filmTrackBadges, filmTrackKind, filmTrackPrefix, type FilmBox } from './film.ts';
 
 import { DISPLAY_FPS, exactRate } from './timecode.ts';
 import { trimFence } from './timeline-drag.ts';
@@ -32,11 +33,15 @@ export type TimelineLaneKind = 'visual' | 'audio';
 
 /* ── Zoom ─────────────────────────────────────────────────────────────────── */
 
+/** Where a project keeps the library's things it uses (studio/server saved.mjs takeSaved): their pages are under it. */
+const LIBRARY_PAGES = 'saved/openfilm/';
+
 /**
  * Zoom is how much time one screen shows, not a pixel density.
  *
  * 100% = the whole film just fills the width. Default 80%: a 10 s film shows 12.5 s, with room on the right. Widest:
- * four times the film. Narrowest: always 1 s (30 frames), whatever the film's length, so a short film can still be
+ * four times the film, and never less than an empty timeline shows (a short film keeps the view it was put in at).
+ * Narrowest: always 1 s (30 frames), whatever the film's length, so a short film can still be
  * zoomed all the way in.
  */
 /** The narrowest view: 1 s = 30 frames. */
@@ -61,7 +66,7 @@ export const ZOOM_STEP = 1.6;
 
 /** The most time one view can show. */
 export function viewSpanMaxMs(totalMs: number): number {
-  return Math.max(Math.max(0, totalMs) * VIEW_SPAN_MAX_FACTOR, VIEW_SPAN_MIN_MS);
+  return Math.max(Math.max(0, totalMs) * VIEW_SPAN_MAX_FACTOR, VIEW_SPAN_EMPTY_MS);
 }
 
 /** The lowest zoom (relative to fitting the film). */
@@ -234,8 +239,7 @@ function clamp(n: number, lo: number, hi: number): number {
 
 /**
  * Label and tick spacing, worked out separately: labels need room to read (≥96 px), ticks are lines and can sit
- * 12 px apart. One shared spacing forces a choice between overlapping labels and ticks too sparse to aim by (OpenCut's
- * approach, which it says is CapCut's table).
+ * 12 px apart. One shared spacing would force a choice between overlapping labels and ticks too sparse to aim by.
  *
  * Steps are in frames of the project's rate, then whole seconds, because frames are what gets lined up: a
  * "1/2/5 × 10ⁿ ms" family gives 200 ms steps that are neither whole seconds nor whole frames. A step shorter than a
@@ -345,6 +349,10 @@ export type TimelineBlockKind = 'mg' | 'video' | 'voice' | 'sfx' | 'music' | 'ca
 export interface TimelineBlock {
   id: string;
   title: string;
+  /** The library's text (isLibraryText): the words it says, as its overrides set them; absent when they are its own. */
+  words?: string;
+  /** A caption track's cue (lib/caption-blocks): its file and its id there. No clip of film.html, edited as one. */
+  cue?: { src: string; id: string };
   startMs: number;
   endMs: number;
   kind: TimelineBlockKind;
@@ -421,7 +429,7 @@ export interface TimelineTrack {
   /** Row title. */
   name: string | null;
   /**
-   * The row's badge: `P1` / `V2` / `A1`, the Premiere / Resolve naming (pictures counted bottom up, sound top
+   * The row's badge: `V2` / `V1` / `A1` (pictures counted bottom up, sound top
    * down), one per drawn row (rows of one track spread by overlap each get their own, see badgeRows).
    */
   badge?: string;
@@ -439,10 +447,25 @@ export interface TimelineTrack {
   /** How tall the row is drawn, px, when the person set it (lib/track-heights); else the timeline's own for its kind. */
   height?: number;
   /**
-   * The main track's rows: the lowest picture track, where the magnet acts (lib/timeline-edit mainTrackOf), marked and
-   * drawn taller as CapCut draws its main track.
+   * The main track's rows: the lowest picture track, where the magnet and linkage act (lib/timeline-edit mainTrackOf),
+   * marked and drawn taller than the others.
    */
   main?: boolean;
+  /** A caption track (SPEC §1 Captions): its WebVTT file and name. It has no clips; its row draws the file's cues. */
+  captions?: { src: string; label?: string };
+  /**
+   * A row of nothing but the heads of transitions on one track (lib/transitions foldHeads): drawn as nothing, each
+   * transition shown by its mark on the track it comes in over.
+   */
+  folded?: boolean;
+  /** A track of the library's text only: drawn as a caption track is, narrow, each clip by its words. */
+  text?: boolean;
+  /**
+   * A track of things of the library laid over the film only (stickers, effects, filters, templates' pages): no video
+   * or picture of the film on it. Drawn low, as a text track is; such things may go on it even when it is the main
+   * track (they cut no film there).
+   */
+  overlay?: boolean;
   blocks: TimelineBlock[];
 }
 
@@ -511,6 +534,8 @@ export interface TimelineFilm {
     silent?: boolean;
   }[];
   captions: readonly { key: string; startMs: number; durMs: number; text: string; loc?: string }[];
+  /** Video clips whose file was not probed (yet): whether they carry sound is not known. */
+  unprobed?: number;
   /**
    * film.html as on disk. The evaluated lists only hold clips with a length, so an empty track vanishes from them;
    * the timeline still draws it, as a place to drop onto.
@@ -522,6 +547,7 @@ export interface TimelineFilm {
 interface Block {
   id: string;
   title: string;
+  words?: string;
   startMs: number;
   endMs: number;
   kind: TimelineBlock['kind'];
@@ -572,25 +598,8 @@ export function blockTitleOf(block: { title: string; atRef?: string | undefined;
   return notes.length ? `${block.title} · ${notes.join(' · ')}` : block.title;
 }
 
-/**
- * Clips that overlap by no more than this touch (SPEC): times are kept to the millisecond, a clip's start and its
- * length each rounded alone, so two that touch can overlap by one.
- */
-const TOUCH_MS = 1;
-
-/**
- * Lay clips into rows that do not overlap. Two clips overlapping on one row cannot be drawn honestly, so an overlap
- * opens another row. Greedy (the first row it fits), so the rows stay stable: drawing the same film again must not
- * move the clip just clicked.
- */
-function layered(blocks: Block[]): Block[][] {
-  const rows: Block[][] = [];
-  for (const block of [...blocks].sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs)) {
-    const row = rows.find((r) => (r.at(-1)?.endMs ?? 0) <= block.startMs + TOUCH_MS);
-    if (row) row.push(block); else rows.push([block]);
-  }
-  return rows;
-}
+/** The same row allocation is used when exporting Studio's row names. */
+const layered = layerBlocks;
 
 /**
  * Each clip where film.html puts it now.
@@ -637,6 +646,18 @@ function withDocTimes(film: TimelineFilm): TimelineFilm {
   };
 }
 
+/** Where a project keeps a text of the library once taken (server takeSaved: `saved/openfilm/text-<name>/`). */
+const LIBRARY_TEXT = 'saved/openfilm/text-';
+/** Whether a clip is one of the library's texts (a line of words, a name card, a callout…). */
+export const isLibraryText = (src: string | undefined): boolean => Boolean(src?.split('#')[0]?.startsWith(LIBRARY_TEXT));
+
+/** The words a clip's overrides give its page (each part's text), joined; null when none. */
+function overrideWords(clip: Record<string, unknown> | undefined): string | null {
+  const list = Array.isArray(clip?.overrides) ? clip.overrides as { text?: unknown }[] : [];
+  const words = list.map((o) => (typeof o?.text === 'string' ? o.text.trim() : '')).filter(Boolean);
+  return words.length ? words.join(' · ') : null;
+}
+
 function docTracksOf(doc: unknown): readonly Record<string, unknown>[] {
   if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return [];
   const tracks = (doc as { tracks?: unknown }).tracks;
@@ -654,15 +675,22 @@ function docTrackKind(track: Record<string, unknown>): string {
 }
 
 /**
- * Row badges, Premiere / Resolve style: P1, P2… for page tracks, V1… for picture tracks, A1… for sound tracks, counted
+ * Row badges: V1, V2… for picture tracks (footage, stills, pages, captions), A1… for sound tracks, counted
  * from position and kind, never read from the film (filmTrackBadges).
  *
  * Counted per drawn row, not per film.html track: a track spread into four rows by overlap is A2, A3, A4, A5 and the
  * music under it is A6. Four rows all called A2 could not be pointed at.
  */
-function badgeRows<T extends { role: string }>(rows: readonly T[]): (T & { badge: string })[] {
-  const badges = filmTrackBadges(rows.map((row) => ({ kind: row.role })));
+function badgeRows<T extends { role: string; captions?: unknown }>(rows: readonly T[]): (T & { badge: string })[] {
+  /* a caption track is picture: drawn over the rows under it, counted with them */
+  const badges = filmTrackBadges(rows.map((row) => ({ kind: row.captions ? 'video' : row.role })));
   return rows.map((row, i) => ({ ...row, badge: badges[i]! }));
+}
+
+/** A film.html track's caption file and name, when it is a caption track. */
+function captionsOf(track: Record<string, unknown>): { src: string; label?: string } | null {
+  const c = track.captions as { src?: unknown; label?: unknown } | undefined;
+  return c && typeof c.src === 'string' ? { src: c.src, ...(typeof c.label === 'string' && c.label ? { label: c.label } : {}) } : null;
 }
 
 /**
@@ -808,6 +836,7 @@ export function layoutTracks(evaluated: TimelineFilm): TimelineTrack[] {
   interface DocRow {
     name: string; kind: string; blocks: Block[];
     hidden?: boolean; muted?: boolean; locked?: boolean;
+    captions?: { src: string; label?: string };
   }
   const byIndex = new Map<number, DocRow>();
   const take = (t: DocTrackRef): DocRow => {
@@ -852,11 +881,15 @@ export function layoutTracks(evaluated: TimelineFilm): TimelineTrack[] {
     if (v.track && v.loc) videoLocs.add(v.loc);
   }
 
+  const docClips = new Map(docTracksOf(film.doc).flatMap((t) => (Array.isArray(t.clips) ? t.clips as Record<string, unknown>[] : []))
+    .filter((c) => typeof c?.id === 'string').map((c) => [c.id as string, c]));
   for (const s of film.scenes) {
     if (!s.track || s.durMs <= 0 || (s.loc != null && videoLocs.has(s.loc))) continue;
     claim(s.track.index, s.clipId);
+    const words = isLibraryText(s.src) ? overrideWords(s.clipId ? docClips.get(s.clipId) : undefined) ?? fileStem(s.src ?? '') : null;
     take(s.track).blocks.push({
       id: s.key,
+      ...(words != null ? { words } : {}),
       /* a clip is called by its file, as in any editor (its id is film.html's, shown in the inspector); a page's
          file name drops the extension: `.html` says what it is written in, not what the clip is */
       title: fileStem(s.src ?? '') || s.clipId || fileStem(s.label),
@@ -866,8 +899,9 @@ export function layoutTracks(evaluated: TimelineFilm): TimelineTrack[] {
       ...(s.loc ? { loc: s.loc } : {}),
       ...(s.anchor ? { anchor: s.anchor } : {}),
       /* an MG's right edge is unlimited (past its end it holds the last frame); its left edge stops at its start,
-         with or without a duration of its own (without the limit a left edge past 0 only slid the page along) */
-      room: { headMs: Math.max(0, s.inMs ?? 0) },
+         with or without a duration of its own (without the limit a left edge past 0 only slid the page along). A
+         thing of the library's is pulled out as far as there is room: it lengthens (film-shape: as a still) */
+      ...(filmSrcIsLibrary(s.src) ? {} : { room: { headMs: Math.max(0, s.inMs ?? 0) } }),
       ...visualExtras(s),
       ...metaFields(s.meta),
     });
@@ -963,10 +997,12 @@ export function layoutTracks(evaluated: TimelineFilm): TimelineTrack[] {
   for (const [index, t] of docTracksOf(film.doc).entries()) {
     if (byIndex.has(index)) continue;
     const kind = docTrackKind(t);
+    const captions = captionsOf(t);
     byIndex.set(index, {
-      name: kind,
-      kind,
+      name: captions?.label ?? kind,
+      kind: captions ? 'mg' : kind,
       blocks: [],
+      ...(captions ? { captions } : {}),
       ...(t.hidden ? { hidden: true } : {}),
       ...(t.muted ? { muted: true } : {}),
       ...(t.locked ? { locked: true } : {}),
@@ -980,7 +1016,7 @@ export function layoutTracks(evaluated: TimelineFilm): TimelineTrack[] {
     blocks: Block[],
     name?: string | null,
     docIndex?: number,
-    flags?: { hidden?: boolean; muted?: boolean; locked?: boolean; incomplete?: boolean },
+    flags?: { hidden?: boolean; muted?: boolean; locked?: boolean; incomplete?: boolean; captions?: { src: string; label?: string } },
   ): void => {
     const hidden = Boolean(flags?.hidden);
     const muted = Boolean(flags?.muted);
@@ -1004,6 +1040,9 @@ export function layoutTracks(evaluated: TimelineFilm): TimelineTrack[] {
         hidden,
         locked,
         ...(flags?.incomplete ? { incomplete: true } : {}),
+        ...(flags?.captions ? { captions: flags.captions } : {}),
+        ...(row.length && row.every((b) => b.words != null) ? { text: true } : {}),
+        ...(row.length && row.some((b) => b.words == null) && row.every((b) => b.src?.startsWith(LIBRARY_PAGES)) ? { overlay: true } : {}),
         blocks: row,
       });
     }
@@ -1012,7 +1051,7 @@ export function layoutTracks(evaluated: TimelineFilm): TimelineTrack[] {
   const rows = [...byIndex.entries()].sort((a, b) => a[0] - b[0]);
   /* nothing at all: no rows, so the timeline shows its "drag assets here" state instead of dead rows (with length 0
      every gesture is off). Partly empty tracks are drawn: they are where things get dropped. */
-  if (rows.every(([, row]) => row.blocks.length === 0)) return [];
+  if (rows.every(([, row]) => row.blocks.length === 0 && !row.captions)) return [];
   const docTracks = docTracksOf(film.doc);
   for (const [index, row] of rows) {
     const drawn = new Set(row.blocks.map((b) => b.clipId));
@@ -1034,13 +1073,14 @@ export function layoutTracks(evaluated: TimelineFilm): TimelineTrack[] {
         muted: row.muted,
         locked: row.locked,
         incomplete,
+        ...(row.captions ? { captions: row.captions } : {}),
       },
     );
   }
 
   /* badges last, per drawn row top to bottom (see badgeRows); the main track marked (the lowest picture track) */
   const badged = badgeRows(tracks);
-  const pictures = badged.filter((r) => r.role !== 'audio' && r.docIndex != null).map((r) => r.docIndex!);
+  const pictures = badged.filter((r) => r.role !== 'audio' && r.docIndex != null && !r.captions && !r.text).map((r) => r.docIndex!);
   const main = pictures.length ? Math.max(...pictures) : null;
   return main == null ? badged : badged.map((r) => (r.docIndex === main ? { ...r, main: true } : r));
 }

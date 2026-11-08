@@ -5,8 +5,7 @@
  *   desktop:local-agents:list        → [{ id, label, cli: { path, source } | null, signedIn, install, setupRequired }]
  *   desktop:local-agents:sign-in     { agent } → Terminal runs its own sign-in, which opens its own page
  *   desktop:local-agents:probe       { agent } → { ok, info }: a session opened and closed, only for its options
- *                                    (model, reasoning effort) and its commands (info.commands), so the menu and the
- *                                    composer's / show them before the first message
+ *                                    (model, reasoning effort), so the menu shows them before the first message
  *   desktop:local-agents:start       { agent, cwd, resume? } → { ok, key, info } | { ok: false, error, code? }
  *                                    resume: the agent's own id of a conversation it had (info.sessionId of an earlier
  *                                    start), taken up where it stopped: the session still open here (a reloaded
@@ -14,7 +13,8 @@
  *   desktop:local-agents:prompt      { key, text, meta?, images? } → { ok, stopReason } | { ok: false, error }
  *                                    images: [{ data (base64), mimeType }], the pictures of the message's references,
  *                                    sent after the text to an agent that takes pictures (the text names their files
- *                                    either way)
+ *                                    either way); `model` beside the stopReason: the model that answered, for an
+ *                                    agent whose session names none (Copilot's, from its record)
  *   desktop:local-agents:steer       { key, text, images? } → { ok, outcome }   a message sent while a turn runs,
  *                                    into that turn (ok: it joined it); the page sends it as a turn of its own if not
  *   desktop:local-agents:adopt       { key, turnId | null, meta? }   what the agent does with nobody having written (a
@@ -45,12 +45,13 @@
  * into `.film/logs/<turn>.model.jsonl`, as the app's own agent writes its own.
  */
 import { randomUUID } from 'node:crypto';
-import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { recordProblem, problemsFile } from 'openfilm/problems';
 import { LOG_SETTLE_MS } from './agent-logs.mjs';
-import { RECORDED_AGENTS, agentRecordCalls, compactCalls } from './agent-records.mjs';
+import { RECORDED_AGENTS, agentRecordCalls, compactCalls, recordedModel } from './agent-records.mjs';
 import { skillStore } from './agent-skills.mjs';
-import { AgentSession, HARNESS_AGENTS, isAgentId, isChatAgent, listAgents, openAgentSignIn } from './agents.mjs';
-import { loggedBlocks, openLog, writeModelLog } from './chat-store.mjs';
+import { AGENTS, AgentSession, HARNESS_AGENTS, isAgentId, isChatAgent, listAgents, openAgentSignIn, optionsForModel, probeFolder } from './agents.mjs';
+import { loggedBlocks, logsDir, openLog, writeModelLog } from './chat-store.mjs';
 import { loginShellVariables } from './environment.mjs';
 
 const TURN_LOG_MAX = 5000;
@@ -59,12 +60,10 @@ const BETWEEN_TURNS_MAX = 500;
 /** a session nobody has spoken in for this long closes; how often that is looked at */
 const IDLE_MS = 20 * 60_000;
 const IDLE_CHECK_MS = 60_000;
-/** how long a session opened for its options waits for the agent to say its commands */
-const PROBE_COMMANDS_MS = 1500;
 /** how long after its turn a session whose skills changed closes: the page has settled the turn by then */
 const STALE_CLOSE_MS = 3000;
-/** the pictures one message may carry, and how big each (base64 of a JPEG at most 1280 px wide) */
-const PROMPT_IMAGES_MAX = 8;
+/** the pictures one message may carry (the page's PROMPT_PICTURES_MAX), and how big each (base64, at most 2000 px a side) */
+const PROMPT_IMAGES_MAX = 20;
 const PROMPT_IMAGE_MAX_CHARS = 8 * 1024 * 1024;
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
@@ -87,6 +86,21 @@ export async function keepAgentRecord({ agent, sessionId, cwd, turnId, from, to,
   }
 }
 
+/**
+ * The model that answered a Copilot turn from `from` (ms), as its own record names it, for a session that names none:
+ * read once its last usage record has had time to reach the file, as keepAgentRecord waits. Null for any other agent
+ * (at once, without waiting), or when none is found.
+ */
+export async function turnModel({ agent, sessionId, from, env = null, settleMs = RECORD_SETTLE_MS }) {
+  if (agent !== 'copilot' || !sessionId) return null;
+  try {
+    await new Promise((done) => setTimeout(done, settleMs));
+    return recordedModel({ agent, sessionId, from, env: env ?? await loginShellVariables({ staleOk: true }) });
+  } catch {
+    return null;
+  }
+}
+
 /** The page's pictures as ACP image blocks; anything not one is left out. */
 function imageBlocks(images) {
   if (!Array.isArray(images)) return [];
@@ -94,6 +108,33 @@ function imageBlocks(images) {
     .filter((image) => typeof image?.data === 'string' && image.data.length > 0 && image.data.length <= PROMPT_IMAGE_MAX_CHARS && IMAGE_TYPES.has(image.mimeType))
     .slice(0, PROMPT_IMAGES_MAX)
     .map((image) => ({ type: 'image', data: image.data, mimeType: image.mimeType }));
+}
+
+/**
+ * The error as the agent sent it (ACP's code, message and data), under any rewording on the way (errorCause,
+ * explainFailure), for the turn log; null when it sent none.
+ */
+export function sentError(e) {
+  let asSent = e;
+  while (asSent?.cause) asSent = asSent.cause;
+  return typeof asSent?.code === 'number' ? { code: asSent.code, message: asSent.message, data: asSent.data ?? null } : null;
+}
+
+/**
+ * An agent that did not start, did not answer, or whose process ended by itself, as Studio's problems keep it
+ * (openfilm's problems.mjs): why, the step it stopped at, its program, the last of its stderr, and where its turn's log
+ * is.
+ * @param {{ agent: string, cwd: string, session?: any }} entry @param {string} step @param {any} e @param {string | null} [turnId]
+ */
+export function agentProblem(entry, step, e, turnId = null) {
+  const failure = entry.session?.failure?.() ?? {};
+  const stderr = String(failure.stderr ?? entry.session?.stderr ?? '').trim().split(/\r?\n/).slice(-5).join('\n');
+  return {
+    area: 'agent', agent: AGENTS[entry.agent]?.label ?? (entry.agent === 'byok' ? 'Own key' : entry.agent), agentId: entry.agent,
+    what: e instanceof Error ? e.message : String(e), step: failure.step ?? e?.step ?? step, ...(e?.code != null ? { code: String(e.code) } : {}),
+    project: entry.cwd, ...(turnId ? { log: join(logsDir(entry.cwd), `${turnId.replace(/:/g, '-')}.jsonl`) } : {}),
+    ...(failure.program ? { program: failure.program } : {}), ...(stderr ? { stderr } : {}), ...(failure.ownLogs ? { ownLogs: failure.ownLogs } : {}),
+  };
 }
 
 /**
@@ -106,17 +147,22 @@ function imageBlocks(images) {
  * `skills`: where the app keeps its record of skills (`dataDir`) and the person's own skills (`mine`): each session has its maker's skills and MCP servers, OpenFilm's skills, and of the person's own those let
  * in (agent-skills.mjs).
  * @param {{ trusted: (event: any) => boolean, binDir?: string | null, fallbackDir?: string | null, env?: Record<string, string>,
- *           harness?: (id: string) => Promise<any>, onWorking?: (folders: string[]) => void, onAsking?: (folders: string[]) => void, logDir?: () => string | null,
+ *           harness?: (id: string) => Promise<any>, onWorking?: (folders: string[]) => void, onAsking?: (folders: string[]) => void, onConnectionResult?: (id: string, error: unknown | null) => void, logDir?: () => string | null,
  *           skills?: { dataDir: string, mine: string } | null }} opts
  */
-export function registerLocalAgentIpc(ipcMain, { trusted, binDir = null, fallbackDir = null, env = {}, harness = async () => null, log = () => {}, onWorking = () => {}, onAsking = () => {}, logDir = () => null, skills = null }) {
+export function registerLocalAgentIpc(ipcMain, { trusted, binDir = null, fallbackDir = null, env = {}, harness = async () => null, log = () => {}, onWorking = () => {}, onAsking = () => {}, onConnectionResult = (_agent, _error) => {}, logDir = () => null, skills = null }) {
   const harnessFor = async (agent) => (HARNESS_AGENTS.includes(agent) ? harness(agent) : undefined);
   const skillRecord = skills ? skillStore(skills.dataDir) : null;
+  /* what went wrong, kept in Studio's home with Studio's own problems (openfilm's problems.mjs), for its report */
+  const problems = env.OPENFILM_HOME ? problemsFile(env.OPENFILM_HOME) : undefined;
+  const noteProblem = (entry, step, e, turnId = null) => recordProblem(agentProblem(entry, step, e, turnId), { file: problems });
   /** a session's skills and MCP servers: OpenFilm's, and of the person's own those let in (agent-skills.mjs) */
   const skillsFor = (agent) => (skills && skillRecord ? { ...skills, allowed: skillRecord.allowed(agent), mcpAllowed: skillRecord.mcpAllowed(agent) } : null);
   /** @type {Map<string, { session: AgentSession, sender: import('electron').WebContents, pending: Map<string, (answer: any) => void>, agent: string, cwd: string, turn: any }>} */
   const sessions = new Map();
   let activePrompts = 0;
+  /** the agent the chat last started a conversation with: the one Studio's own questions go to (`ask`) */
+  let lastAgent = null;
   /** the folders a turn is running in now: what a project cannot be deleted from under */
   const working = () => [...new Set([...sessions.values()].filter((entry) => entry.running > 0).map((entry) => entry.cwd))];
   /** the folders where an agent waits for the person's answer (a permission, a question): told on each change */
@@ -175,19 +221,20 @@ export function registerLocalAgentIpc(ipcMain, { trusted, binDir = null, fallbac
     if (!isChatAgent(agent)) return { ok: false, error: `Unknown agent: ${String(agent)}` };
     let session;
     try {
-      /* its commands too (the composer's / menu), which it says just after the session opens: waited for a moment */
-      let commands = null;
-      let said = () => {};
-      const heard = new Promise((done) => { said = done; });
-      session = new AgentSession({ agent, cwd: homedir(), binDir, fallbackDir, env, harness: await harnessFor(agent),
-        onUpdate: (update) => { if (update?.sessionUpdate === 'available_commands_update') { commands = update.availableCommands ?? null; said(); } } });
-      const info = await session.start();
-      await Promise.race([heard, new Promise((done) => setTimeout(done, PROBE_COMMANDS_MS))]);
-      return { ok: true, info: { ...info, ...(commands ? { commands } : {}) } };
+      let options = null;
+      session = new AgentSession({ agent, cwd: probeFolder(), binDir, fallbackDir, env, harness: await harnessFor(agent),
+        onUpdate: (update) => { if (update?.sessionUpdate === 'config_option_update') options = update.configOptions ?? null; } });
+      let info = await session.start();
+      if (options) info = { ...info, configOptions: options };
+      options = null;
+      info = await optionsForModel(session, info, typeof opts?.model === 'string' ? opts.model : undefined);
+      if (options) info = { ...info, configOptions: options };
+      return { ok: true, info };
     } catch (e) {
       const error = e instanceof Error ? e.message : String(e);
       /* the model menu says only that it could not start: what went wrong is kept here (logs/studio.log) */
       log(`probe ${agent}: ${error.replace(/\s+/g, ' ').slice(0, 500)}\n`);
+      onConnectionResult(agent, e);
       return { ok: false, error, ...(e?.code ? { code: String(e.code) } : {}) };
     } finally {
       session?.close();
@@ -198,8 +245,11 @@ export function registerLocalAgentIpc(ipcMain, { trusted, binDir = null, fallbac
     const agent = opts?.agent;
     const cwd = opts?.cwd;
     const resume = typeof opts?.resume === 'string' && opts.resume ? opts.resume : null;
+    /* the turn it starts for: a start that fails is written in that turn's log, as a prompt that fails is */
+    const meta = opts?.meta && typeof opts.meta === 'object' ? opts.meta : null;
     if (!isChatAgent(agent)) return { ok: false, error: `Unknown agent: ${String(agent)}` };
     if (typeof cwd !== 'string' || !cwd) return { ok: false, error: 'Missing project folder.' };
+    lastAgent = agent;
     /* the conversation still open here (the page was reloaded): taken up as it is, no second process */
     const open = resume ? [...sessions].find(([, e]) => e.agent === agent && e.cwd === cwd && e.info?.sessionId === resume && e.sender === event.sender) : null;
     if (open) {
@@ -216,7 +266,9 @@ export function registerLocalAgentIpc(ipcMain, { trusted, binDir = null, fallbac
         resume,
         binDir,
         fallbackDir,
-        env,
+        /* its name to Studio, by the chat's conversation: the `openfilm` commands it runs say so, and Studio tells it
+           once what the person changed while it worked (openfilm's studio/client.mjs agentName) */
+        env: { ...env, OPENFILM_AGENT: `app:${typeof meta?.sessionId === 'string' && meta.sessionId ? meta.sessionId : key}` },
         logDir: logDir(),
         skills: skillsFor(agent),
         harness: await harnessFor(agent),
@@ -233,7 +285,13 @@ export function registerLocalAgentIpc(ipcMain, { trusted, binDir = null, fallbac
           send(entry, key, { kind: 'question', requestId, ...ask });
           tellAsking();
         }),
-        onExit: (info) => { send(entry, key, { kind: 'exit', ...info }); sessions.delete(key); if (entry.running > 0) onWorking(working()); },
+        onExit: (info) => {
+          /* ended by itself (not closed here), and not well: a problem */
+          if (sessions.get(key) === entry && info.code) noteProblem(entry, 'exit', new Error(`${AGENTS[agent]?.label ?? agent}'s process ended with code ${info.code}.`), entry.turn && !entry.turn.done ? entry.turn.meta?.turnId : null);
+          send(entry, key, { kind: 'exit', ...info });
+          sessions.delete(key);
+          if (entry.running > 0) onWorking(working());
+        },
         onSend: (sent) => {
           const file = entry.turn && !entry.turn.done ? entry.turn.file : entry.adopted;
           file?.write('sent', { ...sent, prompt: loggedBlocks(cwd, sent.prompt) });
@@ -245,8 +303,18 @@ export function registerLocalAgentIpc(ipcMain, { trusted, binDir = null, fallbac
       entry.info = info;
       return { ok: true, key, info: { ...info, authMethods: [], mcp: false } };
     } catch (e) {
+      const result = { ok: false, error: e instanceof Error ? e.message : String(e), ...(e?.code ? { code: String(e.code) } : {}) };
+      onConnectionResult(agent, e);
+      if (meta?.turnId) {
+        const raw = sentError(e);
+        const file = openLog(cwd, meta.turnId, (err) => log(`turn log ${meta.turnId}: ${err.message}\n`));
+        file?.write('start', { ...result, agent, cwd, resume, meta, ...(raw ? { raw } : {}), ...entry.session?.failure?.() });
+        file?.end();
+      }
+      /* one not installed, or not set up, is not a problem of the app's: the chat says what to do */
+      if (e?.code !== 'not-installed' && e?.code !== 'not-ready') noteProblem(entry, 'start', e, meta?.turnId ?? null);
       close(key);
-      return { ok: false, error: e instanceof Error ? e.message : String(e), ...(e?.code ? { code: String(e.code) } : {}) };
+      return result;
     }
   });
 
@@ -270,20 +338,34 @@ export function registerLocalAgentIpc(ipcMain, { trusted, binDir = null, fallbac
     entry.running = (entry.running ?? 0) + 1;
     onWorking(working());
     let result;
+    let connectionError = null;
+    /* the error as the agent sent it (ACP's code, message and data), for the turn log */
+    let raw = null;
     try {
       result = { ok: true, stopReason: await entry.session.prompt([{ type: 'text', text }, ...images], { turnId: meta?.turnId }) };
     } catch (e) {
+      connectionError = e;
       /* `balance`: the service the app's own agent runs on has no balance left (agents.mjs), and where to top it up */
       result = { ok: false, error: e instanceof Error ? e.message : String(e), ...(e?.balance ? { balance: e.balance } : {}) };
+      raw = sentError(e);
+      if (!e?.balance) noteProblem(entry, 'prompt', e, meta?.turnId ?? null);
     } finally {
       activePrompts--;
       entry.running -= 1;
       onWorking(working());
     }
+    if (!result.ok || (result.stopReason?.stopReason !== 'cancelled' && result.stopReason !== 'cancelled')) onConnectionResult(entry.agent, connectionError);
+    /* GitHub Copilot, its session naming no model (on some accounts): the one that answered, as its own record says,
+       for the turn's footer */
+    if (result.ok && entry.agent === 'copilot' && !entry.info?.configOptions?.some((o) => o?.category === 'model')) {
+      const model = await turnModel({ agent: entry.agent, sessionId: entry.info?.sessionId, from });
+      if (model) result = { ...result, model };
+    }
     entry.lastUsed = Date.now();
     if (turn) {
-      /* a turn that failed: what the agent's process last wrote to stderr says why */
-      turn.file.write('done', result.ok ? result : { ...result, stderr: String(entry.session?.stderr ?? '').slice(-8000) });
+      /* a turn that failed: the error as the agent sent it, the step it stopped at, its program and what its process
+         last wrote to stderr say why */
+      turn.file.write('done', result.ok ? result : { ...result, ...(raw ? { raw } : {}), ...entry.session?.failure?.() });
       turn.file.end();
       turn.done = result;
       entry.turnEnded = Date.now();
@@ -392,16 +474,44 @@ export function registerLocalAgentIpc(ipcMain, { trusted, binDir = null, fallbac
   return {
     isBusy: () => activePrompts > 0,
     working,
+    /** the agent the chat last started a conversation with, or null */
+    lastAgent: () => lastAgent,
+    /**
+     * One question answered by `agent`'s own model, with no chat: Studio's own work that needs a model (translating
+     * subtitles). A session of its own in an empty folder, where the agent may do nothing but answer (`answerOnly`: every
+     * permission refused; every question skipped); its words, whole. `signal` stops it.
+     * @param {string} agent @param {string} text @param {AbortSignal} [signal] @returns {Promise<string>}
+     */
+    ask: async (agent, text, signal) => {
+      if (!isChatAgent(agent)) throw new Error(`Unknown agent: ${String(agent)}`);
+      let said = '';
+      const session = new AgentSession({
+        agent, cwd: probeFolder(), binDir, fallbackDir, env, harness: await harnessFor(agent), answerOnly: true,
+        onUpdate: (update) => { if (update?.sessionUpdate === 'agent_message_chunk' && update.content?.type === 'text') said += update.content.text ?? ''; },
+        onQuestion: async () => null,
+      });
+      const stop = () => { void session.cancel().catch(() => {}); session.close(); };
+      signal?.addEventListener('abort', stop, { once: true });
+      try {
+        await session.start();
+        signal?.throwIfAborted();
+        await session.prompt([{ type: 'text', text }]);
+        return said;
+      } finally {
+        signal?.removeEventListener('abort', stop);
+        session.close();
+      }
+    },
     closeAll: () => [...sessions.keys()].forEach(close),
     /** an agent disconnected in Settings: its sessions close */
     closeAgent: (agent) => { for (const [key, entry] of [...sessions]) if (entry.agent === agent) close(key); },
     /**
-     * The skills or MCP servers let in changed for an agent: its sessions close (one at work once its turn ends), and the next message
-     * takes each conversation up again with them.
+     * The skills or MCP servers let in changed for an agent (none named: for every agent): its sessions close (one at
+     * work once its turn ends), and the next message takes each conversation up again with them.
      */
     refreshSkills: (agent) => {
       for (const [key, entry] of [...sessions]) {
-        if (entry.agent !== agent) continue;
+        if (agent && entry.agent !== agent) continue;
         if (entry.running > 0) entry.stale = true; else close(key);
       }
     },

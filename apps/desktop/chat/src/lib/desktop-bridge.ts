@@ -10,10 +10,10 @@
 import type { Balance } from './balance';
 
 /** The coding agents the shell can connect to its MCP endpoint. */
-export type DesktopAgentId = 'claude' | 'codex' | 'cursor' | 'copilot' | 'gemini' | 'opencode' | 'codebuddy' | 'devin';
+export type DesktopAgentId = 'claude' | 'codex' | 'cursor' | 'copilot' | 'opencode' | 'codebuddy' | 'devin';
 
-/** The chat's agents: the person's own (Codex, Claude Code, Gemini CLI, …), and the app's own on their own key. */
-export type LocalAgentId = 'claude' | 'codex' | 'gemini' | 'copilot' | 'cursor' | 'opencode' | 'codebuddy' | 'qwen' | 'kimi' | 'byok';
+/** The chat's agents: the person's own (Codex, Claude Code, Qwen Code, …), and the app's own on their own key. */
+export type LocalAgentId = 'claude' | 'codex' | 'copilot' | 'cursor' | 'opencode' | 'codebuddy' | 'qwen' | 'kimi' | 'minimax' | 'deepseek' | 'antigravity' | 'byok';
 
 /** One agent as the app's roster has it (apps/desktop/src/agent-roster.mjs; Studio's lib/host.ts HostAgent). */
 export interface RosterAgent {
@@ -23,7 +23,10 @@ export interface RosterAgent {
   status: 'ready' | 'off' | 'sign-in' | 'waiting' | 'missing' | 'key' | 'checking';
   install?: string | null;
   setupRequired?: string | null;
+  configurationRevision?: number;
   error?: string;
+  /** Whose sign-in it uses, when the agent tells (no key or token). */
+  account?: { method: string; email?: string; org?: string; plan?: string };
   /**
    * The own key's models, each set up on its own (its name, its service, the model asked for there), with the reasoning
    * efforts it offers and the one it starts on (apps/desktop src/pi-config.mjs EFFORTS); the first one to begin with.
@@ -50,8 +53,6 @@ export interface LocalAgentSessionInfo {
   resumed?: boolean;
   /** a message sent while it works can join the running turn (`steer`) */
   steering?: boolean;
-  /** its commands, as a session opened only to ask said them (`probe`): ACP's availableCommands */
-  commands?: unknown[];
   agentInfo: { name: string; title?: string; version?: string } | null;
   authMethods: Array<{ id: string; name: string; description?: string }>;
   /** Whether our MCP tools were handed over (not when the agent does not take HTTP). */
@@ -180,6 +181,8 @@ export interface DesktopBridge {
     list(): Promise<RosterAgent[]>;
     connect(id: LocalAgentId): Promise<{ ok: boolean; error?: string }>;
     onChange(listener: (agents: RosterAgent[]) => void): () => void;
+    /** The diagnostic report (the computer, the last week's problems, the agents) on the clipboard. Older shells lack it. */
+    copyReport?(): Promise<{ ok: boolean }>;
   };
   /** Studio's Settings, on Agents (or Providers). */
   openSettings?(section?: 'agents' | 'providers'): void;
@@ -192,15 +195,19 @@ export interface DesktopBridge {
     /** Opens Terminal to run its own sign-in command, which opens Anthropic's / OpenAI's sign-in page. */
     signIn(agent: LocalAgentId): Promise<{ ok: true } | { ok: false; error: string }>;
     /** Opens a session and closes it at once, only for its options. Sends no message, so costs nothing. */
-    probe(agent: LocalAgentId): Promise<{ ok: true; info: LocalAgentSessionInfo } | { ok: false; error: string; code?: string }>;
-    /** `resume`: the agent's own id of a conversation it had (an earlier start's info.sessionId), to go on with */
-    start(agent: LocalAgentId, cwd: string, resume?: string | null): Promise<
+    probe(agent: LocalAgentId, model?: string): Promise<{ ok: true; info: LocalAgentSessionInfo } | { ok: false; error: string; code?: string }>;
+    /**
+     * `resume`: the agent's own id of a conversation it had (an earlier start's info.sessionId), to go on with.
+     * `meta`: the turn it starts for, whose log says why when it does not start.
+     */
+    start(agent: LocalAgentId, cwd: string, resume?: string | null, meta?: LocalAgentTurnMeta): Promise<
       | { ok: true; key: string; info: LocalAgentSessionInfo }
       | { ok: false; error: string; code?: string; install?: string }
     >;
     /** `images`: pictures sent after the text, to an agent that takes them (the shell asks the session) */
     /** `balance`: the service the app's own agent runs on had no balance left for it */
-    prompt(key: string, text: string, meta?: LocalAgentTurnMeta, images?: PromptImage[]): Promise<{ ok: true; stopReason: string } | { ok: false; error: string; balance?: Balance }>;
+    /** `model`: the model that answered, for an agent whose session names none (GitHub Copilot's, from its record) */
+    prompt(key: string, text: string, meta?: LocalAgentTurnMeta, images?: PromptImage[]): Promise<{ ok: true; stopReason: string; model?: string } | { ok: false; error: string; balance?: Balance }>;
     /** Turns still held by the shell (a reload mid-turn). Older shells lack it. */
     running?(): Promise<LocalAgentRunningTurn[]>;
     /** The page has put this finished turn back: the shell forgets it. */
@@ -210,7 +217,7 @@ export interface DesktopBridge {
     /** What the agent does with nobody having written is the turn `turnId` (null: no longer), in its log. */
     adopt?(key: string, turnId: string | null, meta?: LocalAgentTurnMeta): Promise<{ ok: boolean }>;
     cancel(key: string): Promise<{ ok: true }>;
-    setOption(key: string, configId: string, value: unknown): Promise<{ ok: boolean; error?: string }>;
+    setOption(key: string, configId: string, value: unknown): Promise<{ ok: boolean; error?: string; result?: { configOptions?: LocalAgentSessionInfo['configOptions'] } }>;
     answerPermission(key: string, requestId: string, optionId: string | null): Promise<{ ok: boolean }>;
     /** Answers its question; null = skip. Older shells lack it (and never ask). */
     answerQuestion?(key: string, requestId: string, answers: Record<string, LocalAgentAnswer> | null): Promise<{ ok: boolean }>;

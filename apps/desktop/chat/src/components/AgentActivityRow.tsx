@@ -11,7 +11,7 @@ import { Markdown } from './Markdown';
 import { AttachmentPreview } from './AttachmentPreview';
 import { elapsedLabel, useTick } from './useTicker';
 import { useT } from '@/i18n';
-import { actGroupParts, buildRuns, EPHEMERAL_ACT_LABELS, pendingWork } from '@/lib/agent-activity-runs';
+import { actGroupParts, buildRuns, EPHEMERAL_ACT_LABELS, idleStatus, pendingWork } from '@/lib/agent-activity-runs';
 import { StickToBottomContext } from './useStickToBottom';
 import { WaitingContext } from '@/lib/developer';
 
@@ -24,7 +24,7 @@ import { WaitingContext } from '@/lib/developer';
  * sight does not depend on anyone guarding a switch.
  *
  * No expandable input / output here, no ✓/✗. One row is one plain sentence. Acts finished back to back
- * fold into one row that opens on click, like Cursor's step summary.
+ * fold into one row that opens on click, including while they run, like Cursor's step summary.
  */
 
 export interface AgentActivityItem {
@@ -57,7 +57,7 @@ export interface AgentActivityItem {
   endedAt?: number;
 }
 
-/** One folded run. Acts finished back to back form a group; text and the running row stand alone. */
+/** One folded run. Adjacent acts form a group from the start; text stands alone. */
 interface ActivityRun {
   items: AgentActivityItem[];
 }
@@ -73,23 +73,20 @@ interface ActivityRun {
  * `oldProps === newProps`, without comparing props.
  *
  * The inner map is bucketed by key because one row has different keys in different lists (live and
- * archived). The fold count is in the key too: when a run of repeated acts grows, only that row is
- * rebuilt, not the ones before it.
+ * archived). Member identities are checked too: completing any tool in a group must update its row.
  */
-const ROW_ELEMENTS = new WeakMap<AgentActivityItem, Map<string, React.ReactElement>>();
+const ROW_ELEMENTS = new WeakMap<AgentActivityItem, Map<string, { items: AgentActivityItem[]; element: React.ReactElement }>>();
 
 function rowElement(run: ActivityRun, key: string): React.ReactElement {
   const first = run.items[0]!;
   let byKey = ROW_ELEMENTS.get(first);
   if (!byKey) { byKey = new Map(); ROW_ELEMENTS.set(first, byKey); }
-  // An asset can arrive late (the saved transcript fills in a receipt the live stream missed) with the count unchanged, so the asset count is in the key too.
-  let assets = 0;
-  for (const item of run.items) if (item.asset) assets += 1;
-  const cacheKey = `${key}#${run.items.length}#${assets}`;
+  const cacheKey = `${key}#${run.items.length}`;
   const hit = byKey.get(cacheKey);
-  if (hit) return hit;
+  // A later member can finish or gain an asset while the first member and the group size stay unchanged.
+  if (hit && hit.items.every((item, index) => item === run.items[index])) return hit.element;
   const made = <AgentActivityRow key={key} items={run.items} />;
-  byKey.set(cacheKey, made);
+  byKey.set(cacheKey, { items: run.items, element: made });
   return made;
 }
 
@@ -144,11 +141,11 @@ const AgentActivityRow = React.memo(function AgentActivityRow({
      Drawn as a labeled divider: it marks that the agent no longer sees the original text above it. */
   if (item.kind === 'notice') {
     /* A local agent's own notice (a Codex warning): its words, quiet, apart from what it says to the person */
-    if (item.text) return <p className="break-words py-1 text-[12px] leading-relaxed text-[var(--chat-hint)]">{item.text}</p>;
+    if (item.text) return <p className="break-words py-1 text-[12px] leading-relaxed text-[var(--text-faint)]">{item.text}</p>;
     return (
       <div className="flex items-center gap-2.5 py-1.5">
         <span className="h-px flex-1 bg-[var(--border)]" />
-        <span className="shrink-0 text-[11px] text-[var(--chat-hint)]">{t(item.label)}</span>
+        <span className="shrink-0 text-[11px] text-[var(--text-faint)]">{t(item.label)}</span>
         <span className="h-px flex-1 bg-[var(--border)]" />
       </div>
     );
@@ -200,14 +197,14 @@ function ThoughtRow({ item }: { item: AgentActivityItem }) {
     ? t('turnFrame.thought').replace('{t}', formatWorkDuration(ms))
     : t('turnFrame.thoughtShort');
   const text = (item.text ?? '').trim();
-  if (!text) return <div className="py-1 text-[14px] leading-relaxed text-[var(--chat-hint)]">{label}</div>;
+  if (!text) return <div className="py-1 text-[14px] leading-relaxed text-[var(--text-faint)]">{label}</div>;
   return (
     <div className="min-w-0 py-1">
       <button
         type="button"
         aria-expanded={open}
         onClick={() => setOpen((value) => !value)}
-        className="flex items-center gap-1.5 text-[14px] leading-relaxed text-[var(--chat-hint)] hover:text-[var(--chat-text)]"
+        className="flex items-center gap-1.5 text-[14px] leading-relaxed text-[var(--text-faint)] hover:text-[var(--text)]"
       >
         {label}
         <ChevronDown size={14} className={`transition-transform ${open ? 'rotate-180' : ''}`} />
@@ -233,7 +230,7 @@ function PlanRow({ item }: { item: AgentActivityItem }) {
   const done = plan.filter((entry) => entry.status === 'completed').length;
   return (
     <div className="min-w-0 py-1.5">
-      <div className="mb-1 text-[13px] text-[var(--chat-hint)]">
+      <div className="mb-1 text-[13px] text-[var(--text-faint)]">
         {t('turnFrame.plan').replace('{done}', String(done)).replace('{total}', String(plan.length))}
       </div>
       <ul className="flex flex-col gap-0.5">
@@ -244,9 +241,9 @@ function PlanRow({ item }: { item: AgentActivityItem }) {
               <Icon
                 size={13}
                 aria-hidden
-                className={`mt-[5px] shrink-0 ${entry.status === 'in_progress' ? 'text-[var(--chat-text)]' : 'text-[var(--chat-hint)]'}`}
+                className={`mt-[5px] shrink-0 ${entry.status === 'in_progress' ? 'text-[var(--text)]' : 'text-[var(--text-faint)]'}`}
               />
-              <span className={entry.status === 'in_progress' ? 'text-[var(--chat-text)]' : 'text-[var(--chat-hint)]'}>
+              <span className={entry.status === 'in_progress' ? 'text-[var(--text)]' : 'text-[var(--text-faint)]'}>
                 {entry.content}
               </span>
             </li>
@@ -294,11 +291,11 @@ const ACT_ICONS: Record<string, LucideIcon> = {
 };
 
 /**
- * A folded group of finished acts.
+ * A folded group of adjacent acts, running or finished.
  *
- * Closed by default. The summary says which kinds of act ran and how many of each (see actGroupParts);
- * the pictures and sounds the group made stay in the rows of the acts that made them. The running row is
- * not in here; it uses the progressive form and shimmers.
+ * Closed by default. Only the acts that finished fold: the summary says which kinds ran and how many of each
+ * (see actGroupParts), and the pictures and sounds they made stay in the rows of the acts that made them. An
+ * act still running stands under the group, in full, with its clock; once it finishes it joins the count.
  *
  * Opening changes the content height. The asset drawer pins the bottom (pinIfFollowing in the same
  * frame); here the clicked row must stay put instead: skip the next bottom pin and, in the same frame,
@@ -312,20 +309,19 @@ function ActGroup({ items }: { items: AgentActivityItem[] }) {
   const thread = React.useContext(StickToBottomContext);
   const rootRef = React.useRef<HTMLDivElement>(null);
   const anchorTop = React.useRef<number | null>(null);
-  /* Closed until the user opens it — also while the turn runs. The summary counts up in place and the
-     status line under the turn says what is running, so unrolling each finished act only made a wall of rows. */
+  /* Closed until the user opens it — also while the turn runs. The summary counts up in place without
+     unrolling a wall of rows or moving a tool from the status line when it finishes. */
   const [picked, setPicked] = React.useState<boolean | null>(null);
   const open = picked ?? false;
-  const parts = React.useMemo(() => actGroupParts(items), [items]);
+  /* what finished folds; what runs stays in sight under it */
+  const done = React.useMemo(() => items.filter((item) => !item.pending), [items]);
+  const running = items.filter((item) => item.pending);
+  const parts = React.useMemo(() => actGroupParts(done), [done]);
   /* At most three kinds, the rest as a count: seven or eight cut off by an ellipsis tell the reader nothing. */
   const shown = parts.slice(0, GROUP_PARTS_MAX);
   const rest = parts.slice(GROUP_PARTS_MAX).reduce((n, part) => n + part.count, 0);
-  const summary = shown
-    .map((part) => `${t(actCopyKey(part.label, false))}${part.count > 1 ? ` ×${part.count}` : ''}`)
-    .join(' · ');
-  const full = parts
-    .map((part) => `${t(actCopyKey(part.label, false))}${part.count > 1 ? ` ×${part.count}` : ''}`)
-    .join(' · ');
+  const full = parts.map((part) => `${t(actCopyKey(part.label))}${part.count > 1 ? ` ×${part.count}` : ''}`).join(' · ');
+  const summary = shown.map((part) => `${t(actCopyKey(part.label))}${part.count > 1 ? ` ×${part.count}` : ''}`).join(' · ');
   const Icon = ACT_ICONS[parts[0]?.label ?? ''] ?? Layers;
 
   const toggle = () => {
@@ -347,6 +343,11 @@ function ActGroup({ items }: { items: AgentActivityItem[] }) {
     if (delta !== 0) scroller.scrollTop += delta;
   }, [open, thread]);
 
+  const row = (item: AgentActivityItem, index: number) => (item.kind === 'thought'
+    ? <ThoughtRow key={item.id ?? `thought-${index}`} item={item} />
+    : <ActRow key={item.id ?? `${item.label}-${index}`} item={item} />);
+  const live = running.map(row);
+  if (!done.length) return <div ref={rootRef} className="min-w-0">{live}</div>;
   return (
     <div ref={rootRef} className="min-w-0 py-1">
       {/* The chevron follows the text and shows on hover: a dozen groups with a column of chevrons read like a table */}
@@ -355,24 +356,26 @@ function ActGroup({ items }: { items: AgentActivityItem[] }) {
         aria-expanded={open}
         onClick={toggle}
         title={full}
-        className="group/act flex max-w-full min-w-0 items-start gap-2 text-left text-[14px] leading-relaxed text-[var(--chat-hint)] hover:text-[var(--chat-text)]"
+        data-activity-header=""
+        data-activity-id={items[0]?.id}
+        className="group/act flex h-6 w-full min-w-0 items-center gap-2 text-left text-[14px] leading-6 text-[var(--text-faint)] hover:text-[var(--text)]"
       >
-        <Icon size={13} aria-hidden className="mt-[5px] shrink-0" />
-        <span className="min-w-0 truncate">{summary}</span>
+        <Icon size={13} aria-hidden className="shrink-0" />
+        <span data-activity-label="" className="min-w-0 truncate">{summary}</span>
         {rest ? <span className="shrink-0 tabular-nums opacity-80">+{rest}</span> : null}
+        <span className="ml-auto w-12 shrink-0" />
         <ChevronRight
           size={13}
           aria-hidden
-          className={`mt-[5px] shrink-0 transition-[transform,opacity] ${open ? 'rotate-90 opacity-100' : 'opacity-0 group-hover/act:opacity-100 group-focus-visible/act:opacity-100'}`}
+          className={`shrink-0 transition-[transform,opacity] ${open ? 'rotate-90 opacity-100' : 'opacity-0 group-hover/act:opacity-100 group-focus-visible/act:opacity-100'}`}
         />
       </button>
       {open ? (
         <div className="ml-[6px] mt-0.5 border-l border-[var(--border)] pl-3">
-          {items.map((item, index) => (item.kind === 'thought'
-            ? <ThoughtRow key={item.id ?? `thought-${index}`} item={item} />
-            : <ActRow key={item.id ?? `${item.label}-${index}`} item={item} />))}
+          {done.map(row)}
         </div>
       ) : null}
+      {live}
     </div>
   );
 }
@@ -384,40 +387,43 @@ function ActGroup({ items }: { items: AgentActivityItem[] }) {
  * does not code; the agent usually fixes it next, and a red cross only suggests the film is broken. When
  * the turn really fails, a generic message shows above the composer.
  *
- * A running row animates one thing only, the shimmer on its title: several animations per row, over ten
- * rows, read like a dashboard alarm.
+ * The same row stays in place from start to finish. Only its label and clock change; typography, icon,
+ * spacing stay the same. The description follows the visible label, without invisible text reserving a gap.
  *
  * The description (a narration line, a sound or picture description) is film content: it gets quotes and
  * reads apart from the act name. What the act made hangs under the row: images as thumbnails, sounds play
  * on click.
  */
 function ActRow({ item }: { item: AgentActivityItem }) {
-  const t = useT();
   const Icon = ACT_ICONS[item.label];
   return (
-    <div className="flex min-w-0 items-start gap-2 py-1 text-[14px] leading-relaxed">
+    <div className="flex min-w-0 items-start gap-2 py-1 text-[14px] leading-6">
       {Icon ? (
-        <Icon size={13} aria-hidden className="mt-[5px] shrink-0 text-[var(--chat-hint)]" />
+        <Icon size={13} aria-hidden className="mt-[5px] shrink-0 text-[var(--text-faint)]" />
       ) : null}
       <div className="min-w-0 flex-1">
         <div
-          className="flex max-w-full min-w-0 items-baseline gap-1.5 text-left"
+          data-activity-header=""
+          data-activity-id={item.id}
+          aria-busy={!!item.pending}
+          className="flex h-6 max-w-full min-w-0 items-center gap-1.5 text-left"
         >
-          <span className={item.pending ? 'text-sweep shrink-0' : 'shrink-0 text-[var(--chat-hint)]'}>
-            {t(actCopyKey(item.label, item.pending))}
-          </span>
+          <ActivityLabel label={item.label} pending={!!item.pending} />
           {item.query ? (
-            <span className="min-w-0 truncate text-[var(--chat-hint)] opacity-80" title={item.query}>
+            <span className="min-w-0 truncate text-[var(--text-faint)] opacity-80" title={item.query}>
               “{item.query}”
             </span>
           ) : null}
           {/* File name or command: not film content, so no quotes, monospace */}
           {item.detail ? (
-            <span className="min-w-0 truncate font-mono text-[12.5px] text-[var(--chat-hint)] opacity-80" title={item.detail}>
+            <span className="min-w-0 truncate font-mono text-[12.5px] text-[var(--text-faint)] opacity-80" title={item.detail}>
               {item.detail}
             </span>
           ) : null}
-          {item.pending ? <PendingElapsed startedAt={item.startedAt} /> : null}
+          {/* Reserve the clock's width after completion so long commands keep the same truncation. */}
+          <span className="ml-auto flex w-12 shrink-0 justify-end">
+            {item.pending ? <PendingElapsed startedAt={item.startedAt} /> : null}
+          </span>
         </div>
         {item.asset ? <AssetPreview asset={item.asset} /> : null}
         {item.ask?.status ? <AskOutcome ask={item.ask} /> : null}
@@ -426,19 +432,29 @@ function ActRow({ item }: { item: AgentActivityItem }) {
   );
 }
 
+/** Keep both states in the same type style, using only the visible words' width. */
+function ActivityLabel({ label, pending }: { label: string; pending: boolean }) {
+  const t = useT();
+  return (
+    <span data-activity-label="" className="min-w-0 shrink-0 truncate text-[var(--text-faint)]">
+      {t(actCopyKey(label, pending))}
+    </span>
+  );
+}
+
 /** After a question: the answer (verbatim), or skipped / timed out, in which case the agent went on with its own judgment. */
 function AskOutcome({ ask }: { ask: NonNullable<AgentActivityItem['ask']> }) {
   const t = useT();
   if (ask.status === 'answered' && ask.answer) {
     return (
-      <div className="mt-1 flex min-w-0 items-start gap-1.5 text-[var(--chat-hint)]">
-        <CornerDownRight size={13} aria-hidden className="mt-[5px] shrink-0 text-[var(--chat-hint)]" />
+      <div className="mt-1 flex min-w-0 items-start gap-1.5 text-[var(--text-faint)]">
+        <CornerDownRight size={13} aria-hidden className="mt-[5px] shrink-0 text-[var(--text-faint)]" />
         <span className="min-w-0 whitespace-pre-wrap break-words">{ask.answer}</span>
       </div>
     );
   }
   return (
-    <div className="mt-1 flex items-center gap-1.5 text-[var(--chat-hint)]">
+    <div className="mt-1 flex items-center gap-1.5 text-[var(--text-faint)]">
       <CornerDownRight size={13} aria-hidden className="shrink-0" />
       <span>{t(ask.status === 'timeout' ? 'turnAsk.timedOut' : 'turnAsk.skipped')}</span>
     </div>
@@ -476,7 +492,7 @@ function ImageThumb({ asset }: { asset: AgentActAsset }) {
         type="button"
         onClick={() => setOpen(true)}
         title={t('actGroup.openImage')}
-        className="block shrink-0 overflow-hidden rounded-md border border-[var(--border)] bg-[var(--surface-2)] transition-opacity hover:opacity-85"
+        className="block shrink-0 overflow-hidden rounded-md border border-[var(--border)] bg-[var(--bg-field)] transition-opacity hover:opacity-85"
       >
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
@@ -505,7 +521,7 @@ function MediaLink({ asset }: { asset: AgentActAsset }) {
       href={toUrl(asset.src)}
       target="_blank"
       rel="noopener noreferrer"
-      className="inline-flex h-7 items-center gap-1.5 rounded-full border border-[var(--border)] px-2.5 text-[12px] text-[var(--chat-hint)] hover:text-[var(--chat-text)]"
+      className="inline-flex h-7 items-center gap-1.5 rounded-full border border-[var(--border)] px-2.5 text-[12px] text-[var(--text-faint)] hover:text-[var(--text)]"
     >
       <Video size={12} aria-hidden />
       {asset.dur ? formatDur(asset.dur) : null}
@@ -547,8 +563,8 @@ function AudioChip({ asset, label }: { asset: AgentActAsset; label?: string }) {
       title={failed ? t('assets.previewFailed') : undefined}
       className={`inline-flex h-7 max-w-full items-center gap-1.5 rounded-full border px-2.5 text-[12px] transition-colors ${
         playing
-          ? 'border-[var(--accent)] text-[var(--chat-text)]'
-          : 'border-[var(--border)] text-[var(--chat-hint)] hover:text-[var(--chat-text)]'
+          ? 'border-[var(--accent)] text-[var(--text)]'
+          : 'border-[var(--border)] text-[var(--text-faint)] hover:text-[var(--text)]'
       }`}
     >
       {playing ? <Pause size={12} aria-hidden className="shrink-0" /> : <Play size={12} aria-hidden className="shrink-0" />}
@@ -608,18 +624,16 @@ function togglePlayer(url: string, owner: string): void {
 /**
  * While a turn runs, the single row underneath: what is happening now.
  *
- * It stays from start to finish, always one row high, and only its text changes, which keeps the
- * panel from jumping.
+ * A visible status has its own row above the hover actions. When there is nothing to say, render nothing
+ * rather than an empty row separating the reply from its copy button and model name.
  *
- *   · work running: that act (with its description or command when there is one); several in
- *     parallel read "Narrate ×7 · Sound effect ×6";
+ *   · work running: nothing, because the tool already has its row in the conversation;
  *   · thinking: "Thinking";
  *   · neither: the caller's text (reconnecting and the like), else "Thinking".
  *
- * The clock counts from the earliest start among the running acts. When the turn ends this row becomes
- * the footer, at the same height (h-6).
+ * `ownAgent`: the turn runs on the app's own agent (see IdleStatus).
  */
-export function StatusLine({ items, fallback }: { items: AgentActivityItem[]; fallback?: string | null }) {
+export function StatusLine({ items, fallback, ownAgent = false }: { items: AgentActivityItem[]; fallback?: string | null; ownAgent?: boolean }) {
   const t = useT();
   const running = React.useMemo(() => pendingWork(items), [items]);
   /* The last time anything happened: each new item (text, an act starting or finishing) gives the list a new identity */
@@ -631,32 +645,18 @@ export function StatusLine({ items, fallback }: { items: AgentActivityItem[]; fa
   if (waitingForYou) return <StatusShell Icon={MessageCircleQuestion} label={t('act.waitingForYou')} since={changedAt} waiting />;
   const acts = running.filter((item) => item.kind === 'act');
   if (acts.length) {
-    const parts = actGroupParts(acts);
-    const label = parts.slice(0, GROUP_PARTS_MAX)
-      .map((part) => `${t(part.label)}${part.count > 1 ? ` ×${part.count}` : ''}`)
-      .join(' · ');
-    const extra = acts.length === 1 ? (acts[0]!.query ? `“${acts[0]!.query}”` : acts[0]!.detail) : undefined;
-    let since: number | undefined;
-    for (const item of acts) if (item.startedAt != null && (since == null || item.startedAt < since)) since = item.startedAt;
-    /* Only waiting on the person's answer: that time is theirs, not the agent's work — no clock, no sweep. */
-    const waiting = acts.every((item) => item.label === 'act.chat.ask');
-    return <StatusShell Icon={ACT_ICONS[parts[0]!.label]} label={label} extra={extra} since={since ?? changedAt} waiting={waiting} />;
+    return null;
   }
   if (running.length || fallback) {
     return <StatusShell label={running.length ? t('act.thinking') : fallback!} since={changedAt} />;
   }
-  /* The agent is speaking (text still streaming): no "Working" underneath, the text itself moves. The row
-     keeps its height so what comes next does not jump. Just after a paragraph, stay blank a while (the
-     seconds spent wrapping up a turn, or an act about to start) and say "Working" only once it is quiet. */
+  /* The agent is speaking (text still streaming): no "Working" underneath, the text itself moves. Just after a
+     paragraph, say nothing for a while (the seconds spent wrapping up a turn, or an act about to start)
+     and say "Working" only once it is quiet. */
   let last: AgentActivityItem | undefined;
   for (let i = items.length - 1; i >= 0; i -= 1) if (items[i]!.kind !== 'notice') { last = items[i]; break; }
-  if (last?.kind === 'text' && last.pending) return <StatusBlank />;
-  return <IdleStatus since={changedAt} quietFirst={last?.kind === 'text'} />;
-}
-
-/** The status row's empty slot: same height, says nothing. */
-function StatusBlank() {
-  return <div role="status" aria-hidden className="h-6" />;
+  if (last?.kind === 'text' && last.pending) return null;
+  return <IdleStatus since={changedAt} quietFirst={last?.kind === 'text'} ownAgent={ownAgent} />;
 }
 
 /** How long after a paragraph before saying "Working". */
@@ -669,27 +669,29 @@ const AFTER_TEXT_MS = 5_000;
  * written, which can be two minutes of silence. With only a stop button showing, that looks frozen. So
  * the row stays: "Working" plus the seconds since the last activity, "Still working" after half a minute
  * of quiet. A moving clock shows it is alive.
+ *
+ * The app's own agent says "Waiting for the model" after two minutes, with why as the row's faint words: some
+ * models think for minutes before the first word. Those words go in the row, not on a line of their own, so it
+ * stays one row high.
  */
-const QUIET_MS = 30_000;
-
-function IdleStatus({ since, quietFirst = false }: { since: number; quietFirst?: boolean }) {
+function IdleStatus({ since, quietFirst = false, ownAgent = false }: { since: number; quietFirst?: boolean; ownAgent?: boolean }) {
   const t = useT();
   const tick = useTick();
   const idle = (tick ?? Date.now()) - since;
-  if (quietFirst && idle < AFTER_TEXT_MS) return <StatusBlank />;
-  const quiet = idle >= QUIET_MS;
-  return <StatusShell label={t(quiet ? 'act.stillWorking' : 'act.working')} since={since} />;
+  if (quietFirst && idle < AFTER_TEXT_MS) return null;
+  const label = idleStatus(idle, ownAgent);
+  return <StatusShell label={t(label)} extra={label === 'act.waitingForModel' ? t('act.waitingForModelHint') : undefined} plain since={since} />;
 }
 
 /* Status row: the act's icon while an act runs; thinking / working is text only, flush left. The shimmer
    already says "in progress", so no spinner and no empty slot pushing the text right. */
-function StatusShell({ Icon, label, extra, since, waiting = false }: { Icon?: LucideIcon | undefined; label: string; extra?: string | undefined; since: number; waiting?: boolean }) {
+function StatusShell({ Icon, label, extra, plain = false, since, waiting = false }: { Icon?: LucideIcon | undefined; label: string; extra?: string | undefined; plain?: boolean; since: number; waiting?: boolean }) {
   return (
     <div role="status" className="flex h-6 min-w-0 items-center gap-2 text-[14px]">
-      {Icon ? <Icon size={13} aria-hidden className="shrink-0 text-[var(--chat-hint)]" /> : null}
+      {Icon ? <Icon size={13} aria-hidden className="shrink-0 text-[var(--text-faint)]" /> : null}
       <span className={`${waiting ? '' : 'text-sweep '}min-w-0 truncate ${extra ? 'max-w-[60%] shrink-0' : ''}`}>{label}</span>
       {extra ? (
-        <span className={`min-w-0 truncate text-[var(--chat-hint)] opacity-80 ${extra.startsWith('“') ? '' : 'font-mono text-[12.5px]'}`} title={extra}>
+        <span className={`min-w-0 truncate text-[var(--text-faint)] opacity-80 ${plain || extra.startsWith('“') ? '' : 'font-mono text-[12.5px]'}`} title={extra}>
           {extra}
         </span>
       ) : null}
@@ -707,7 +709,7 @@ function PendingElapsed({ startedAt }: { startedAt: AgentActivityItem['startedAt
   const elapsed = elapsedLabel(startedAt, tick);
   if (!elapsed) return null;
   return (
-    <span className="ml-auto shrink-0 tabular-nums text-[11px] text-[var(--chat-hint)]">
+    <span className="ml-auto shrink-0 tabular-nums text-[11px] text-[var(--text-faint)]">
       {elapsed}
     </span>
   );

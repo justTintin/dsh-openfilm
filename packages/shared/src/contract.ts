@@ -29,6 +29,8 @@ export const turnAttachmentSchema = z.object({
   thumb: z.string().max(TURN_ATTACHMENT_THUMB_MAX_CHARS).optional(),
   /** The original's sha256, to open it at full size (only its owner can). Older messages have none. */
   sha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  /** A folder's path on this computer, to show it in the file manager. Files and older messages have none. */
+  path: z.string().min(1).max(4096).optional(),
 });
 export type TurnAttachment = z.infer<typeof turnAttachmentSchema>;
 
@@ -265,9 +267,14 @@ export interface PublicProgressSnapshot {
 export function clipTranscriptText(text: string, max: number): string {
   if (text.length <= max) return text;
   const tail = (keep: number) => `\n…(+${text.length - keep})`;
-  // keeping one less character can add a digit to the note: converge
+  /* A cut between a surrogate pair would end the line with half an emoji. Keeping one less character can add a digit
+     to the note, so both are checked as the cut converges. */
+  const halves = (keep: number) => {
+    const before = text.charCodeAt(keep - 1), after = text.charCodeAt(keep);
+    return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
+  };
   let keep = Math.max(0, max - tail(max).length);
-  while (keep > 0 && keep + tail(keep).length > max) keep -= 1;
+  while (keep > 0 && (keep + tail(keep).length > max || halves(keep))) keep -= 1;
   return `${text.slice(0, keep)}${tail(keep)}`;
 }
 

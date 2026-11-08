@@ -35,20 +35,32 @@ contextBridge.exposeInMainWorld('openfilmNative', {
     open: (projectId) => ipcRenderer.invoke('desktop:tabs:new', { projectId }),
     move: (id, index) => ipcRenderer.invoke('desktop:tabs:move', { id, index }),
     report: (state) => ipcRenderer.invoke('desktop:tabs:report', state ?? {}),
+    gone: (projectIds) => ipcRenderer.invoke('desktop:tabs:gone', { projectIds }),
+    retitle: (id, title) => ipcRenderer.invoke('desktop:tabs:retitle', { id, title }),
     openRequest: (to) => ipcRenderer.invoke('desktop:tabs:open', { to }),
     onPick: on('desktop:tabs:pick'),
+    onCovered: on('desktop:tabs:covered'),
   },
 
   /* the roster (agent-roster.mjs): Settings → Agents and the chat's menu */
   agents: {
     list: () => ipcRenderer.invoke('desktop:agents:list'),
+    refresh: () => ipcRenderer.invoke('desktop:agents:refresh'),
     connect: (id) => ipcRenderer.invoke('desktop:agents:connect', { id }),
+    cancelSignIn: (id) => ipcRenderer.invoke('desktop:agents:cancel-sign-in', { id }),
     disconnect: (id) => ipcRenderer.invoke('desktop:agents:disconnect', { id }),
+    /* signed out with its own command, then its sign-in opened (agent-roster.mjs switchAccount) */
+    switchAccount: (id) => ipcRenderer.invoke('desktop:agents:switch-account', { id }),
     usage: (id, fresh) => ipcRenderer.invoke('desktop:agents:usage', { id, fresh: fresh === true }),
     setShown: (id, shown) => ipcRenderer.invoke('desktop:agents:shown', { id, shown: shown === true }),
     locate: (id, words) => ipcRenderer.invoke('desktop:agents:locate', { id, words }),
     useAutomatic: (id) => ipcRenderer.invoke('desktop:agents:automatic', { id }),
+    install: (id) => ipcRenderer.invoke('desktop:agents:install', { id }),
     diagnose: (id) => ipcRenderer.invoke('desktop:agents:diagnose', { id }),
+    openSetup: (id) => ipcRenderer.invoke('desktop:agents:setup', { id }),
+    report: () => ipcRenderer.invoke('desktop:agents:report'),
+    /* the whole diagnostic report on the clipboard (main.mjs): the chat's, by a turn that failed */
+    copyReport: () => ipcRenderer.invoke('desktop:diagnostics:copy'),
     saveOwnModel: (config) => ipcRenderer.invoke('desktop:agents:own-model', { config }),
     removeOwnModel: (id) => ipcRenderer.invoke('desktop:agents:own-model-remove', { id }),
     /* the MCP servers the person added to it themselves, each let into OpenFilm or not (skills-ipc.mjs) */
@@ -64,8 +76,8 @@ contextBridge.exposeInMainWorld('openfilmNative', {
     list: () => ipcRenderer.invoke('desktop:local-agents:list'),
     signIn: (agent) => invoke('desktop:local-agents:sign-in')({ agent }),
     disconnect: (agent) => invoke('desktop:local-agents:disconnect')({ agent }),
-    probe: (agent) => invoke('desktop:local-agents:probe')({ agent }),
-    start: (agent, cwd, resume) => invoke('desktop:local-agents:start')({ agent, cwd, resume }),
+    probe: (agent, model) => invoke('desktop:local-agents:probe')({ agent, model }),
+    start: (agent, cwd, resume, meta) => invoke('desktop:local-agents:start')({ agent, cwd, resume, meta }),
     prompt: (key, text, meta, images) => invoke('desktop:local-agents:prompt')({ key, text, meta, images }),
     running: () => ipcRenderer.invoke('desktop:local-agents:running'),
     ack: (key, turnId) => invoke('desktop:local-agents:ack')({ key, turnId }),
@@ -84,22 +96,27 @@ contextBridge.exposeInMainWorld('openfilmNative', {
     load: (project) => ipcRenderer.invoke('desktop:chat:load', { project }),
     saveSessions: (project, sessions, last) => ipcRenderer.invoke('desktop:chat:sessions', { project, sessions, last }),
     saveTurn: (project, turn, items) => ipcRenderer.invoke('desktop:chat:turn', { project, turn, items }),
-    log: (project, turnId, unless) => ipcRenderer.invoke('desktop:chat:log', { project, turnId, unless }),
+    log: (project, turnId, since) => ipcRenderer.invoke('desktop:chat:log', { project, turnId, since }),
     reveal: (project, turnId) => ipcRenderer.invoke('desktop:chat:reveal', { project, turnId }),
     saveRefImage: (project, turnId, n, bytes) => ipcRenderer.invoke('desktop:chat:ref-image', { project, turnId, n, bytes }),
+    saveAttachment: (project, name, bytes) => ipcRenderer.invoke('desktop:chat:attachment', { project, name, bytes }),
+    describePaths: (paths) => ipcRenderer.invoke('desktop:chat:paths', { paths }),
     unsaved: (project, except) => ipcRenderer.invoke('desktop:chat:unsaved', { project, except }),
     snapshot: (project, turnId) => ipcRenderer.invoke('desktop:chat:snapshot', { project, turnId }),
     changes: (project, turnId) => ipcRenderer.invoke('desktop:chat:changes', { project, turnId }),
+    undo: (project, turnId) => ipcRenderer.invoke('desktop:chat:undo', { project, turnId }),
   },
   /* the composer's Skills button (skills-ipc.mjs) */
   skills: {
     list: (project, agent) => ipcRenderer.invoke('desktop:skills:list', { project, agent }),
     texts: (project, agent, names) => ipcRenderer.invoke('desktop:skills:texts', { project, agent, names }),
     allow: (agent, name, allowed) => ipcRenderer.invoke('desktop:skills:allow', { agent, name, allowed }),
+    /* one of OpenFilm's skills turned on or off: the agents' sessions take it up */
+    changed: () => ipcRenderer.invoke('desktop:skills:changed'),
     preview: (url) => ipcRenderer.invoke('desktop:skills:preview', { url }),
     /* a folder dropped (its path), or null: one picked in the system's dialog, with the page's words { title, button } */
     previewFolder: (path, words) => ipcRenderer.invoke('desktop:skills:preview', { folder: typeof path === 'string' ? path : null, words }),
-    commit: (id) => ipcRenderer.invoke('desktop:skills:commit', { id }),
+    commit: (id, covers) => ipcRenderer.invoke('desktop:skills:commit', { id, covers }),
     discard: (id) => ipcRenderer.invoke('desktop:skills:discard', { id }),
     reveal: () => ipcRenderer.invoke('desktop:skills:reveal'),
   },
@@ -109,15 +126,17 @@ contextBridge.exposeInMainWorld('openfilmNative', {
     set: (next) => ipcRenderer.invoke('desktop:prefs:set', next),
     onChange: on('desktop:prefs'),
   },
-  /* a file on the disk brought into the project (the page has no way to read it) */
-  importFile: (request) => ipcRenderer.invoke('desktop:import-file', request),
   /* the chat's column as the person left it, kept for the next launch */
   saveLayout: (layout) => ipcRenderer.send('desktop:layout', { chatOpen: layout?.chatOpen === true, chatWidth: Number(layout?.chatWidth) }),
   /* the page's theme, for the window behind it and the system's menus and dialogs */
   setTheme: (theme) => ipcRenderer.send('desktop:theme', theme === 'dark' ? 'dark' : 'light'),
+  /* the page's language, for what the app shows before a page is up */
+  setLanguage: (language) => ipcRenderer.send('desktop:language', String(language)),
   onFullScreen: on('desktop:full-screen'),
   /* View → Chat in the app's menu */
   onToggleChat: on('desktop:toggle-chat'),
+  /* Native Settings menu and Cmd/Ctrl+,; no renderer can invoke a privileged action here. */
+  onOpenSettings: on('desktop:open-settings'),
   onStudioBrowser: on('desktop:studio-browser'),
   onFfmpeg: on('desktop:ffmpeg'),
   onUpdate: on('desktop:update'),

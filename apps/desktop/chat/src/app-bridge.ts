@@ -35,7 +35,10 @@ interface AppBridge {
   /** the Community over the film; `open`: on that skill's or example's page */
   showExamples?(open?: CommunityItem): void;
   /** a skill picked in the examples, to be named in the message */
-  onUseSkill?(listener: (skill: { name: string; description: string }) => void): () => void;
+  /** a skill picked or tried in Studio's skills: named in the message being written (`newConversation`: in a new one) */
+  onUseSkill?(listener: (skill: { name: string; description: string; title?: string; newConversation?: boolean }) => void): () => void;
+  /** a question Studio writes for the person (lib/host.ts `ask`): its words in the composer, then its references */
+  onAsk?(listener: (request: { text: string; refs: StudioRef[] }) => void): () => void;
   /** "Add a skill" in the examples */
   onAddSkill?(listener: () => void): () => void;
   /** name a skill in the message being written (as one picked in the examples) */
@@ -48,10 +51,10 @@ interface AppBridge {
   draftRefsInStudio(refs: StudioRef[]): void;
   /** what the pointer is over in Studio (null: nothing it points at): pills pointing at the same thing light up */
   onStudioHover(listener: (ref: StudioRef | null) => void): () => void;
+  /** the skills an empty conversation offers (Studio's, with a cover, not turned off), in their order */
+  starterSkills(): Promise<StarterSkill[]>;
   /** the project's files (Studio's listing), for the @ menu */
   projectFiles(): Promise<{ files: Array<{ path: string; kind: string; size: number }>; pages?: Array<{ path: string; size: number }> }>;
-  /** bring a file into the project (assets/upload/): from its path, or its bytes */
-  importFile(file: { path: string; name: string } | { bytes: ArrayBuffer; name: string }): Promise<{ ok: true; path: string } | { ok: false; error: string }>;
   onSelection(listener: (selection: StudioSelection) => void): () => void;
   setChatWidth(width: number, done?: boolean): void;
   setChatOpen(open: boolean): void;
@@ -67,16 +70,22 @@ interface AppBridge {
     load(project: string): Promise<{ sessions: unknown[]; last: string | null; turns: unknown[] }>;
     saveSessions(project: string, sessions: unknown[], last: string | null): Promise<unknown>;
     saveTurn(project: string, turn: unknown, items: unknown[]): Promise<unknown>;
-    /** `unless`: the sizes of the log already read; when it has not grown, `{ same: true }` */
-    log(project: string, turnId: string, unless?: { size: number; callsSize: number }): Promise<TurnLog | { same: true } | null>;
+    /** `since`: where an earlier read stopped (its `at`): only what was written after; nothing new, `{ same: true }` */
+    log(project: string, turnId: string, since?: TurnLogAt): Promise<TurnLog | { same: true } | null>;
     reveal(project: string, turnId?: string): Promise<unknown>;
     /** a picture a message's reference points at, kept for its agent: .film/refs/<turn>-<n>.jpg (its path in the project) */
     saveRefImage(project: string, turnId: string, n: number, bytes: ArrayBuffer): Promise<{ path: string }>;
+    /** a file pasted into a message (it has no path of its own), kept for its agent: .film/attachments/<name> */
+    saveAttachment(project: string, name: string, bytes: ArrayBuffer): Promise<{ path: string }>;
+    /** what each path dragged into a message is, where it is (nothing is copied) */
+    describePaths(paths: string[]): Promise<Array<{ path: string; folder: boolean; size?: number } | { path: string; error: string }>>;
     /** the turns with a log and no saved record (src/chat-store.mjs unsavedTurns), but those of `except` */
     unsaved?(project: string, except?: string[]): Promise<Array<{ turnId: string; events: TurnLog['events'] }>>;
-    /** the project's files as a turn starts, kept by the app; then what the turn changed in them (src/file-changes.mjs) */
+    /** the project's files as a turn starts, kept by the app; then what the turn changed in them (src/file-changes.mjs).
+        `undoable`: the app keeps how the turn found them, which `undo` puts back (while it runs) */
     snapshot(project: string, turnId: string): Promise<unknown>;
-    changes(project: string, turnId: string): Promise<{ files: FileChange[]; cut: boolean } | null>;
+    changes(project: string, turnId: string): Promise<{ files: FileChange[]; cut: boolean; undoable?: boolean } | null>;
+    undo?(project: string, turnId: string): Promise<{ ok: true; restored: number; missed: string[] } | { ok: false; code: 'gone' }>;
   };
   /** what an agent's command asks before it spends (a video clip), and what it tells the person (a provider with no
       balance left), worded by Studio: shown above the composer until answered; the command waits for a question */
@@ -88,12 +97,14 @@ interface AppBridge {
     texts(project: string, agent: string, names: string[]): Promise<Array<{ name: string; text: string }>>;
     /** one of the agent's own skills let into OpenFilm, or not */
     allow(agent: string, name: string, allowed: boolean): Promise<{ ok: boolean }>;
+    /** OpenFilm's skills changed (one added, or turned on or off): the agents' sessions take them up */
+    changed?(): Promise<unknown>;
     /** a GitHub or GitLab address fetched to be looked at; then kept (`commit`) or let go (`discard`) */
     preview(url: string): Promise<{ ok: true; id: string; skills: SkillPreview[] } | { ok: false; error: string }>;
     /** a folder on this computer looked at where it is: one dropped (its path), or null: picked in the system's dialog
         with these words (cancelled: nothing to show) */
     previewFolder(path: string | null, words?: { title: string; button: string }): Promise<{ ok: true; id: string; skills: SkillPreview[] } | { ok: false; error: string } | { ok: false; cancelled: true }>;
-    commit(id: string): Promise<{ ok: true; skills: SkillInfo[] } | { ok: false; error: string }>;
+    commit(id: string, covers?: Record<string, string>): Promise<{ ok: true; skills: SkillInfo[] } | { ok: false; error: string }>;
     discard(id: string): Promise<unknown>;
     reveal(): Promise<unknown>;
   };
@@ -117,6 +128,9 @@ export interface SkillInfo {
   shown?: { title: Record<string, string>; summary: Record<string, string>; details?: Record<string, string> };
 }
 
+/** A skill offered as a card: its cover's address, and its title by language (none: its name). */
+export interface StarterSkill { name: string; description: string; cover: string; title: Record<string, string> | null }
+
 /** A skill fetched from an address, before it is kept: `replaces`, one of the person's has its name. */
 export interface SkillPreview { name: string; description: string; scripts: string[]; size: number; replaces: boolean }
 
@@ -134,16 +148,26 @@ export interface SkillListing {
 /** A question about spending, as Studio words it. */
 export interface SpendAsk { id: string; title: string; body: string | null; allowLabel: string; denyLabel: string }
 
-/** A turn's log as the app wrote it (src/chat-store.mjs): one event a line, each with its time `t` (ms). */
+/** Where a read of a turn's log stopped: bytes into its events and its model requests, and which model log it was. */
+export interface TurnLogAt { events: number; calls: number; callsFile: number }
+
+/**
+ * A turn's log as the app wrote it (src/chat-store.mjs readLog): one event a line, each with its time `t` (ms); the
+ * pictures' bytes left out (a picture: its type, size and file). Read with `since`: only what is new, unless `whole`.
+ */
 export interface TurnLog {
   file: string;
-  /** too long to read whole: these are its last events */
+  /** too long to read whole: its first event and its last ones */
   cut: boolean;
-  size: number;
-  callsSize?: number;
+  /** the events are the log's (not only those after `since`), and so (`callsWhole`) the requests */
+  whole: boolean;
   events: Array<{ t: number; kind: string; [field: string]: unknown }>;
   /** the requests the model got and its answers, each only what is new since the one before (lib/model-calls.ts) */
-  calls?: unknown[];
+  calls: unknown[];
+  callsWhole: boolean;
+  /** the model log grew too long: its later requests were not kept */
+  callsCut: boolean;
+  at: TurnLogAt;
 }
 
 export const app = (window as unknown as { openfilmDesktop: AppBridge }).openfilmDesktop;

@@ -40,6 +40,7 @@ export interface ExportPreset {
   group: ExportPresetGroup;
   frame: Exclude<FilmFrameId, 'native'>;
   shortEdge: number;
+  /** The most frames a second the platform shows: a film is exported at its own rate up to it (presetFps). */
   fps: number;
   /** Vertical feeds are mostly watched muted: subtitles burned in by default. */
   burnSubtitles: boolean;
@@ -68,6 +69,14 @@ export const EXPORT_PRESETS: readonly ExportPreset[] = [
 /** The platforms offered in a language: China's first in Chinese, and none of them in any other. */
 export function exportPresetsFor(language: string): readonly ExportPreset[] {
   return language === 'zh-CN' ? [...EXPORT_PRESETS.filter((p) => p.china), ...EXPORT_PRESETS.filter((p) => !p.china)] : EXPORT_PRESETS.filter((p) => !p.china);
+}
+
+/**
+ * A film's frames a second on a platform: its own, up to the most the platform shows. A 30 fps film is not drawn
+ * twice over for a platform that shows 60: no frame of it would be new.
+ */
+export function presetFps(preset: ExportPreset, filmFps: number): number {
+  return filmFps > 0 ? Math.min(preset.fps, filmFps) : preset.fps;
 }
 
 export function exportPreset(id: string | undefined): ExportPreset | null {
@@ -140,6 +149,12 @@ function givenBitrate(size: { w: number; h: number }, fps: number, quality: Expo
 const TYPICAL_VIDEO = { w: 1920, h: 1080, fps: 30, bytes: 150_000 };
 const VIDEO_SPREAD: readonly [number, number] = [0.25, 4];
 const FIXED_SPREAD: readonly [number, number] = [0.9, 1.1];
+/* ProRes spends what each picture needs, up to about its rate: detailed footage comes to the rate, a title card on a
+   plain background to a twentieth or a tenth of it, a plain frame alone to a fortieth (by its pixels, at any size) */
+const PRORES_SPREAD: readonly [number, number] = [0.04, 1.1];
+/* ffmpeg's prores_ks (Windows, Linux) spends past Apple's 4444 rate on a detailed picture, the further the more detail
+   each pixel holds: a fractal zoom came to 0.87× of it at 4K, 1.3× at 1080p and 1.56× at 720p */
+const PRORES_KS_4444_SPREAD: readonly [number, number] = [0.04, 1.6];
 
 /** How a CRF file's size follows the settings: the quality's CRF, the codec at its CRF. */
 const QUALITY_SIZE: Record<ExportQuality, number> = { standard: 0.58, high: 1, master: 1.6 };
@@ -172,15 +187,17 @@ export function exportEstimateBytes(spec: {
   quality: ExportQuality;
   durationMs: number;
   audio: boolean;
+  /** ProRes encoded by ffmpeg's prores_ks, not by the Mac's media engine */
+  proresKs?: boolean;
 }): [number, number] {
   const sec = Math.max(0, spec.durationMs) / 1000;
   const px = spec.size.w * spec.size.h;
   let videoBps: number;
   let spread = FIXED_SPREAD;
   switch (spec.codec) {
-    /* ProRes is a fixed-rate family: 422 HQ about 220 Mbps at 1080p30, 4444 about 330, scaled by pixels × fps */
-    case 'prores422hq': videoBps = 220_000_000 * (px / (1920 * 1080)) * (spec.fps / 30); break;
-    case 'prores4444': videoBps = 330_000_000 * (px / (1920 * 1080)) * (spec.fps / 30); break;
+    /* ProRes's rate: 422 HQ about 220 Mbps at 1080p30, 4444 about 330, scaled by pixels × fps */
+    case 'prores422hq': videoBps = 220_000_000 * (px / (1920 * 1080)) * (spec.fps / 30); spread = PRORES_SPREAD; break;
+    case 'prores4444': videoBps = 330_000_000 * (px / (1920 * 1080)) * (spec.fps / 30); spread = spec.proresKs ? PRORES_KS_4444_SPREAD : PRORES_SPREAD; break;
     /* HEVC with alpha (VideoToolbox) is given its bitrate */
     case 'hevc_alpha': videoBps = givenBitrate(spec.size, spec.fps, spec.quality, 0.8); break;
     /* a PNG sequence of motion graphics compresses well: about a byte per pixel */

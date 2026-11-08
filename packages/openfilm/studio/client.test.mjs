@@ -7,11 +7,20 @@ import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ensureStudio, olderThanThis, openInStudio, updateOpenfilm } from './client.mjs';
+import { agentName, ensureStudio, olderThanThis, openInStudio, updateOpenfilm } from './client.mjs';
 
-const freePort = () => new Promise((resolve) => {
-  const probe = createServer().listen(0, '127.0.0.1', () => { const { port } = probe.address(); probe.close(() => resolve(port)); });
-});
+/* Studio's port, and the film's next to it, both free. They are below the range every system hands out on its own
+   (Linux from 32768, macOS and Windows from 49152), so no connection or other server takes them while one Studio
+   gives them up to the next. */
+const freePort = async () => {
+  const free = (port) => new Promise((done) => {
+    const probe = createServer().once('error', () => done(false)).listen(port, '127.0.0.1', () => probe.close(() => done(true)));
+  });
+  for (;;) {
+    const port = 20_000 + Math.floor(Math.random() * 12_000);
+    if (await free(port) && await free(port + 1)) return port;
+  }
+};
 
 test('the CLI starts one Studio in the background, reuses it, and it cleans up when stopped', { timeout: 60_000 }, async () => {
   const scratch = mkdtempSync(join(tmpdir(), 'of-client-'));
@@ -134,4 +143,19 @@ test('`openfilm update` in a source checkout says git pull updates it, and touch
   const said = await updateOpenfilm();
   assert.equal(said.ok, true);
   assert.match(said.lines[0], /source checkout: git pull updates it/);
+});
+
+test('the agent running a command: the desktop app\'s by OPENFILM_AGENT, else the program past the shells that ran it', () => {
+  const name = (env) => spawnSync(process.execPath, ['--input-type=module', '-e', `import('${new URL('./client.mjs', import.meta.url)}').then((m) => console.log(m.agentName()))`], {
+    encoding: 'utf8', env: { ...process.env, OPENFILM_AGENT: '', ...env },
+  }).stdout.trim();
+  assert.equal(name({ OPENFILM_AGENT: 'app:c1' }), 'app:c1');
+  /* run through a shell from this process: the shell is passed over, this process is the agent (no /bin/sh on Windows) */
+  if (process.platform !== 'win32') {
+    const viaShell = spawnSync('/bin/sh', ['-c', `"${process.execPath}" --input-type=module -e "import('${new URL('./client.mjs', import.meta.url)}').then((m) => console.log(m.agentName()))"`], {
+      encoding: 'utf8', env: { ...process.env, OPENFILM_AGENT: '' },
+    }).stdout.trim();
+    assert.equal(viaShell, `pid:${process.pid}`);
+  }
+  assert.equal(agentName().startsWith('pid:') || agentName().startsWith('app:'), true);
 });

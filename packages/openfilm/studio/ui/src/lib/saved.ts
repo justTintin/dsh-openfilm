@@ -10,12 +10,15 @@ import { mediaFetch } from './media-queue';
 import {
   factsOfProbe, mediaListingOf, type FilesListing, type MediaFacts, type MediaListing, type MediaResult, type MediaSources,
 } from './workspace-resources';
+import { recycleRefusalOf } from './recycle.ts';
 
 /** The library's top folder as its paths name it. */
 export const SAVED = 'saved';
 
 let version = 0;
 const listeners = new Set<() => void>();
+/** The library as the film's origin serves it (its listing says), where a saved page plays: '' until it is read. */
+let folder = '';
 
 /** Read the library again (something was put in it, or may have been). */
 export function refreshSaved(): void {
@@ -27,11 +30,19 @@ const enc = (path: string) => encodeURIComponent(path);
 const media = (what: string, path: string, v: number) => `/api/saved/media?what=${what}&path=${enc(path)}&v=${v}`;
 
 /** Where the library's pictures, sounds and bytes come from. A bundle is pictured by its poster. */
+/** A page of the library, at its place there (from its top), on the film's origin; none before the listing is read. */
+const pageAt = (rel: string) => (folder ? `${folder}${rel.split('/').map(encodeURIComponent).join('/')}` : undefined);
+
+/* a bundle with a file of its own (a clip of a sound, a video or a picture) is heard, played and pictured as that file */
+const own = (f: { path: string; bundle?: { file?: string } }) => f.bundle?.file ?? f.path;
+
 export const savedSources: MediaSources = {
-  file: (f) => (f.bundle ? `/api/saved/poster?path=${enc(f.path)}&v=${Math.round(f.mtimeMs)}` : `/api/saved/file?path=${enc(f.path)}&v=${Math.round(f.mtimeMs)}`),
-  poster: (f) => (f.bundle ? `/api/saved/poster?path=${enc(f.path)}&v=${Math.round(f.mtimeMs)}` : f.kind === 'video' ? media('poster', f.path, Math.round(f.mtimeMs)) : undefined),
-  wave: (f) => media('wave', f.path, Math.round(f.mtimeMs)),
+  file: (f) => (f.bundle && !f.bundle.file ? `/api/saved/poster?path=${enc(f.path)}&v=${Math.round(f.mtimeMs)}` : `/api/saved/file?path=${enc(own(f))}&v=${Math.round(f.mtimeMs)}`),
+  poster: (f) => (f.bundle && (!f.bundle.file || f.kind !== 'video') ? `/api/saved/poster?path=${enc(f.path)}&v=${Math.round(f.mtimeMs)}` : f.kind === 'video' ? media('poster', own(f), Math.round(f.mtimeMs)) : undefined),
+  wave: (f) => media('wave', own(f), Math.round(f.mtimeMs)),
   pagePoster: (f) => (f.bundle ? `/api/saved/poster?path=${enc(f.path)}&v=${Math.round(f.mtimeMs)}` : undefined),
+  /* a page saved, or a page clip: its page, played as a project's is; a page put in the library as a file: itself */
+  pageSurface: (f) => (f.bundle ? (f.bundle.page ? pageAt(f.bundle.page) : undefined) : pageAt(f.path.slice(SAVED.length + 1))),
 };
 
 /** The library as the media pane lists it, once read (null before, or while `on` is false). */
@@ -46,7 +57,11 @@ export function useSavedListing(on: boolean): MediaListing | null {
   React.useEffect(() => {
     if (!on) return undefined;
     let live = true;
-    void fetch('/api/saved/files', { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null), () => null).then((body) => { if (live && body) setRaw(body); });
+    void fetch('/api/saved/files', { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null), () => null).then((body) => {
+      if (!live || !body) return;
+      if (typeof body.folder === 'string') folder = body.folder;
+      setRaw(body);
+    });
     return () => { live = false; };
   }, [on, seen]);
   /* the window back: its folder may have been changed from the file manager */
@@ -74,7 +89,7 @@ export function useSavedListing(on: boolean): MediaListing | null {
   ) : null), [raw, facts]);
 }
 
-const result = async (res: Response): Promise<MediaResult> => (res.ok ? 'ok' : res.status === 409 ? 'taken' : 'failed');
+const result = async (res: Response): Promise<MediaResult> => (res.ok ? 'ok' : res.status === 409 ? recycleRefusalOf(await res.json().catch(() => null)) ?? 'taken' : 'failed');
 const send = (method: string, url: string, body: unknown) => fetch(url, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
 
 /** The media pane's changes, made in the library; each reads it again. */

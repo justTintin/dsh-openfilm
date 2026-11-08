@@ -5,14 +5,17 @@
  * drawn the way an export draws it: in the headless browser, one frame. One browser for Studio, started on the first
  * request and closed after a minute without any; a few pages kept open (opening one is the slow part); one frame at a
  * time, so thumbnails never compete with the person's own preview for long. Cached in .film/cache by the page file's
- * version, the moment and the width.
+ * version, the moment and the width. Drawn on black, as the film shows a page with nothing below it; a page's poster
+ * in the media pane may be drawn clear instead (a WebP with what the page leaves unpainted transparent).
  */
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { FilmPage, launch } from '../../src/host.mjs';
-import { FILM_FILE } from '../../src/film-doc.mjs';
+import { BrowserMemoryError, memoryError } from '../../src/browser-memory.mjs';
+import { FILM_FILE, clipKind } from '../../src/film-doc.mjs';
+import { browserCopies, filmVideos, madeCopy } from '../../src/seekable.mjs';
 import { TOOL_DIR } from './projects.mjs';
 import { writeAtomic } from './atomic.mjs';
 import { inProject } from './files.mjs';
@@ -38,6 +41,9 @@ const failures = new Map();
 const unopened = new Map();
 /** @type {Map<string, Promise<Buffer>>} frames being drawn, by project and cache key: asked again meanwhile, drawn once */
 const drawing = new Map();
+/** @type {Map<string, { version: string, error: BrowserMemoryError }>} pages whose drawing took more memory than the
+ * browser may have, by project and page, at the version of the page's file then: not drawn again until it changes */
+const heavy = new Map();
 
 /** @type {Promise<import('playwright-core').Browser> | null} */
 let browser = null;
@@ -53,23 +59,28 @@ export class PageFrameError extends Error {}
 export const FILM_PAGE = FILM_FILE;
 
 /**
- * The page `rel` of the folder served at `base` (its film-origin URL), drawn at `ms`, `width` px wide, as JPEG.
+ * The page `rel` of the folder served at `base` (its film-origin URL), drawn at `ms`, `width` px wide, as JPEG (with
+ * `clear`, as a WebP whose unpainted parts are transparent; never the whole film's, which a card shows as it plays).
  * `ms` past the page's end draws its last frame; `ms` < 0 draws the middle (its poster). `overrides`: a page clip's
- * (SPEC §1), drawn with it, so its pictures on the timeline show what was changed in it.
+ * (SPEC §1), drawn with it, so its pictures on the timeline show what was changed in it. `size`: a page clip's, the
+ * CSS pixels a page without a size of its own is laid out at (SPEC §1), as the film lays it out; without one it is
+ * 1920 × 1080, as a page opened on its own.
  * @param {string} root @param {string} base @param {string} rel @param {number} ms @param {number} width
- * @param {object[] | null} [overrides]
+ * @param {object[] | null} [overrides] @param {{ w: number, h: number } | null} [size] @param {boolean} [clear]
  */
-export async function pageFrame(root, base, rel, ms, width, overrides = null) {
+export async function pageFrame(root, base, rel, ms, width, overrides = null, size = null, clear = false) {
+  clear &&= rel !== FILM_PAGE;
   const w = Math.max(32, Math.min(960, Math.round(width / 2) * 2 || 160));
   /* `rel` is the request's: a page of the project only, never one reached by `../` or a link out of the folder */
   const page = inProject(root, rel);
   const info = page ? await stat(page).catch(() => null) : null;
   if (!info?.isFile()) throw new PageFrameError(`${rel} is not there`);
-  /* `black`: how frames are drawn (frames drawn on white before are not reused) */
+  /* `black`: how frames are drawn (frames drawn on white before are not reused); `clear`, on nothing */
   const tweaks = overrides?.some((o) => o && typeof o === 'object' && 'at' in o) ? JSON.stringify(overrides) : '';
-  const key = createHash('sha256').update(`black\0${rel}\0${Math.round(ms)}\0${w}${tweaks ? `\0${tweaks}` : ''}`).digest('hex').slice(0, 24);
+  const laid = size ? `${Math.round(size.w)}x${Math.round(size.h)}` : '';
+  const key = createHash('sha256').update(`${clear ? 'clear' : 'black'}\0${rel}\0${Math.round(ms)}\0${w}${tweaks ? `\0${tweaks}` : ''}${laid ? `\0${laid}` : ''}`).digest('hex').slice(0, 24);
   const dir = join(root, TOOL_DIR, 'cache', 'pageframes');
-  const file = join(dir, `${key}.jpg`);
+  const file = join(dir, `${key}.${clear ? 'webp' : 'jpg'}`);
   /* a frame is good while every file the page loaded to draw it is as it was then: the page, and its styles, code,
      fonts, pictures (a page's look changes with a stylesheet it shares as much as with itself) */
   const known = await readFile(join(dir, `${key}.json`), 'utf8').then((t) => /** @type {string[]} */ (JSON.parse(t).files), () => null);
@@ -85,12 +96,20 @@ export async function pageFrame(root, base, rel, ms, width, overrides = null) {
      hold every thumbnail behind it again on each request */
   const failed = failures.get(id);
   if (failed && Date.now() - failed.at < FAILED_KEPT_MS) throw failed.error;
+  /* a page too heavy to draw is not drawn again, at any moment or width, until its file changes */
+  const pageVersion = `${info.mtimeMs}:${info.size}`;
+  const tooHeavy = heavy.get(`${root}\0${rel}`);
+  if (tooHeavy?.version === pageVersion) throw tooHeavy.error;
   const pending = drawing.get(id);
   if (pending) return pending;
   const made = (async () => {
+    /* the film's footage this browser does not decode (ProRes; HEVC without a chip for it) gets a copy it plays first,
+       served in its place (pages.mjs): drawn without one, the film shows nothing where it is */
+    if (rel === FILM_PAGE) await filmCopies(root, base, info);
     /* a page drawn with tweaks is one of its own: the page kept open for another clip of the same file has none */
     const drawn = tweaks ? `${version}:${createHash('sha256').update(tweaks).digest('hex').slice(0, 12)}` : version;
-    const { jpeg, duration, loaded } = await draw(pageUrl(base, rel), ms, w, drawn, base, tweaks ? overrides : null).catch((e) => {
+    const { jpeg, duration, loaded } = await draw(pageUrl(base, rel), ms, w, drawn, base, tweaks ? overrides : null, laid ? size : null, clear).catch((e) => {
+      if (e instanceof BrowserMemoryError) heavy.set(`${root}\0${rel}`, { version: pageVersion, error: e });
       failures.set(id, { error: e, at: Date.now() });
       if (failures.size > 500) failures.delete(failures.keys().next().value ?? '');
       throw e;
@@ -101,13 +120,14 @@ export async function pageFrame(root, base, rel, ms, width, overrides = null) {
     await mkdir(dir, { recursive: true });
     await writeAtomic(file, jpeg);
     await writeAtomic(join(dir, `${key}.json`), JSON.stringify({ files: deps }));
-    await writeAtomic(join(dir, `${key}.stamp`), await stampOf(root, deps));
     if (rel === FILM_PAGE) {
       /* the whole film's length, learnt on the way: the projects list shows it (projects.mjs filmDuration) */
       if (Number.isFinite(duration)) await writeAtomic(join(root, TOOL_DIR, 'cache', FILM_DURATION), JSON.stringify({ film: `${info.mtimeMs}:${info.size}`, duration }));
       /* the film's poster, kept as its last whatever film.html becomes (filmPoster) */
       if (ms < 0 && w === POSTER_W) await writeAtomic(join(root, TOOL_DIR, 'cache', FILM_POSTER), jpeg);
     }
+    /* the stamp last: a request that finds it takes the frame as made, the film's length and poster written too */
+    await writeAtomic(join(dir, `${key}.stamp`), await stampOf(root, deps));
     return jpeg;
   })();
   drawing.set(id, made);
@@ -115,10 +135,30 @@ export async function pageFrame(root, base, rel, ms, width, overrides = null) {
   return made;
 }
 
-/** What `files` (project relative) are now: each one's change time and size, as one text (a file gone reads so). */
+/**
+ * What `files` (project relative) are now: each one's change time and size, as one text (a file gone reads so); a
+ * video with a copy played in its place (seekable.mjs) says so, so a frame drawn before the copy was made is not kept.
+ */
 async function stampOf(/** @type {string} */ root, /** @type {string[]} */ files) {
-  const parts = await Promise.all(files.map((f) => stat(join(root, f)).then((s) => `${f}:${s.mtimeMs}:${s.size}`, () => `${f}:-`)));
+  const parts = await Promise.all(files.map((f) => stat(join(root, f)).then(
+    (s) => `${f}:${s.mtimeMs}:${s.size}${clipKind(f) === 'video' && madeCopy(join(root, f), root) ? ':copy' : ''}`, () => `${f}:-`)));
   return createHash('sha256').update(parts.join('\n')).digest('hex').slice(0, 24);
+}
+
+/** @type {Map<string, string>} the version of each project's film.html whose footage got its copies */
+const copied = new Map();
+/**
+ * The copies the film's footage needs to be drawn by this browser (seekable.mjs), made once for each version of
+ * film.html (`info`); a footage file changed since gets its own when it is drawn next with a changed film.html.
+ * @param {string} root @param {string} base @param {import('node:fs').Stats} info
+ */
+async function filmCopies(root, base, info) {
+  const version = `${info.mtimeMs}:${info.size}`;
+  if (copied.get(root) === version) return;
+  const b = await started().catch(() => null);
+  if (!b) return;
+  await browserCopies(b, base, root, filmVideos(root, FILM_FILE));
+  copied.set(root, version);
 }
 
 /** The film's last poster, in `.film/cache/`: what its card shows at once while the poster of a changed film is drawn. */
@@ -126,6 +166,9 @@ const FILM_POSTER = 'film-poster.jpg';
 /** How long a card waits for the film's current poster before it is given the last one: one drawn already is read
  * from the cache in far less, and drawing one takes seconds. */
 const STALE_AFTER_MS = 300;
+/** How long a card waits for a film's first poster (none drawn before) before it is told to ask again: the card's
+ * request holds one of the few connections a browser opens to Studio, and the editor's own requests wait behind it. */
+const FIRST_WAIT_MS = 2_000;
 /** How long after a project opens its first poster is drawn: after the editor's own first thumbnails. */
 const WARM_MS = 10_000;
 /** @type {Map<string, NodeJS.Timeout>} projects whose first poster is about to be drawn */
@@ -136,21 +179,31 @@ const warming = new Map();
  * in the projects list. Drawing it takes seconds (the whole film opens, every page in it, one frame at a time behind
  * the open project's own thumbnails), and any change to film.html makes a new one, so a card waiting for it showed
  * nothing. The current poster comes when it is drawn already; else the last one comes at once while the current one
- * is drawn for next time; a film never drawn is waited for.
- * @param {string} root @param {string} base
+ * is drawn for next time; a film never drawn is waited for a moment (FIRST_WAIT_MS), then null: it is still being
+ * drawn, ask again.
+ * @param {string} root @param {string} base @returns {Promise<Buffer | null>}
  */
 export async function filmPoster(root, base) {
   const fresh = pageFrame(root, base, FILM_PAGE, -1, POSTER_W);
+  /* drawn for next time, whoever waits for it: a film that can't be drawn now (a page's library offline) still shows
+     its last picture */
+  fresh.catch(() => {});
+  const soon = await within(fresh.catch(() => null), STALE_AFTER_MS);
+  if (soon) return soon;
+  const last = await readFile(join(root, TOOL_DIR, 'cache', FILM_POSTER)).catch(() => null);
+  if (last) return last;
+  return within(fresh, FIRST_WAIT_MS - STALE_AFTER_MS);
+}
+
+/** What `promise` gives within `ms`, else null (it goes on). @template T @param {Promise<T>} promise @param {number} ms */
+async function within(promise, ms) {
   /** @type {NodeJS.Timeout | undefined} */
   let timer;
-  const soon = await Promise.race([fresh.catch(() => null), new Promise((done) => { timer = setTimeout(() => done(null), STALE_AFTER_MS); })]);
-  clearTimeout(timer);
-  if (soon) return /** @type {Buffer} */ (soon);
-  const last = await readFile(join(root, TOOL_DIR, 'cache', FILM_POSTER)).catch(() => null);
-  if (!last) return fresh;
-  /* drawn for next time: a film that can't be drawn now (a page's library offline) still shows its last picture */
-  fresh.catch(() => {});
-  return last;
+  try {
+    return await Promise.race([promise, new Promise((/** @type {(value: null) => void} */ done) => { timer = setTimeout(() => done(null), ms); })]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -180,6 +233,28 @@ export async function closePageFrames() {
 }
 
 /** Close the browser (Studio is stopping, or nothing was drawn for a while). */
+/**
+ * The browser, started when there is none. One that disconnects (it crashed, or was ended for its memory) is let go
+ * with its pages, and the next request starts another; one that could not start (not downloaded yet on a first run)
+ * is tried again next time.
+ */
+function started() {
+  if (browser) return browser;
+  const starting = launch().then((b) => {
+    b.on('disconnected', () => {
+      if (browser !== starting) return;
+      browser = null;
+      open.clear();
+    });
+    return b;
+  }, (e) => {
+    if (browser === starting) browser = null;
+    throw e;
+  });
+  browser = starting;
+  return starting;
+}
+
 async function closeBrowser() {
   if (idle) clearTimeout(idle);
   const b = browser;
@@ -190,10 +265,11 @@ async function closeBrowser() {
 
 /**
  * Draw `url` at `ms`, `w` px wide. `loaded`: the project's files the page (and every page inside it) loaded, project
- * relative (`base`: where the project is served), so the frame is known stale when one of them changes.
+ * relative (`base`: where the project is served), so the frame is known stale when one of them changes. `clear`: on
+ * nothing rather than black, as a WebP.
  */
-function draw(/** @type {string} */ url, /** @type {number} */ ms, /** @type {number} */ w, /** @type {string} */ version, /** @type {string} */ base, /** @type {object[] | null} */ overrides = null) {
-  return withPage(url, w, version, async (page) => {
+function draw(/** @type {string} */ url, /** @type {number} */ ms, /** @type {number} */ w, /** @type {string} */ version, /** @type {string} */ base, /** @type {object[] | null} */ overrides = null, /** @type {{ w: number, h: number } | null} */ size = null, clear = false) {
+  return withPage(url, w, version, size, async (page) => {
     const duration = lengthOf(page);
     const end = duration != null ? Math.max(0, duration - 1e-3) : Infinity;
     /* a poster: the fullest of a few moments around the middle (a page's middle is often a scene's first, faded-in
@@ -201,19 +277,36 @@ function draw(/** @type {string} */ url, /** @type {number} */ ms, /** @type {nu
     const moments = ms < 0 ? POSTER_AT.map((f) => Math.min(end, (duration ?? NO_END_SPAN) * f)) : [Math.min(ms / 1000, end)];
     let jpeg = null;
     for (const t of moments) {
-      await page.seek(Math.max(0, t), { timeoutMs: FRAME_MS });
-      /* the clip's tweaks, as the film's timeline applies them after each frame (src/overrides.mjs) */
-      if (overrides) {
-        await page.page.evaluate(async (list) => {
-          const { override } = await import(new URL('__film/overrides.mjs', location.href).href);
-          override({ win: window, touched: new Map(), found: [] }, list);
-        }, overrides);
+      const apply = (/** @type {boolean} */ before) => page.page.evaluate(async ({ list, before }) => {
+        if (Boolean(Reflect.get(window, 'film')?.frameReadsOverrides) !== before) return false;
+        const { override, restore } = await import(new URL('__film/overrides.mjs', location.href).href);
+        const clip = { win: window, touched: new Map(), found: [] };
+        override(clip, list);
+        if (before) Reflect.set(window, '__filmRestoreFrameOverrides', () => restore(clip));
+        return true;
+      }, { list: overrides, before });
+      const before = overrides ? await apply(true) : false;
+      try {
+        await page.seek(Math.max(0, t), { timeoutMs: FRAME_MS });
+        if (overrides && !before) await apply(false);
+        const shot = clear ? await clearShot(page) : await page.capture({ format: 'jpeg', quality: 70 });
+        if (!jpeg || shot.length > jpeg.length) jpeg = shot;
+      } finally {
+        /* the same page can next draw another clip, whose controls can be different */
+        if (before) await page.page.evaluate(() => {
+          Reflect.get(window, '__filmRestoreFrameOverrides')?.();
+          Reflect.deleteProperty(window, '__filmRestoreFrameOverrides');
+        }).catch(() => {});
       }
-      const shot = await page.capture({ format: 'jpeg', quality: 70 });
-      if (!jpeg || shot.length > jpeg.length) jpeg = shot;
     }
     return { jpeg: /** @type {Buffer} */ (jpeg), duration, loaded: await loadedFiles(page, base) };
   });
+}
+
+/** The page as it is now on nothing: the open page (kept for other frames) is drawn on black again after. */
+async function clearShot(/** @type {FilmPage} */ page) {
+  await page.ground(true);
+  try { return await page.capture({ format: 'webp', quality: 80 }); } finally { await page.ground(false); }
 }
 
 /** The project's files a page and the pages in it loaded (as resource timing lists them), project relative. */
@@ -247,7 +340,7 @@ export async function pageFacts(root, base, rel) {
   const file = inProject(root, rel);
   const info = file ? await stat(file).catch(() => null) : null;
   if (!info?.isFile()) throw new PageFrameError(`${rel} is not there`);
-  return withPage(pageUrl(base, rel), POSTER_W, `${info.mtimeMs}:${info.size}`, async (page) => {
+  return withPage(pageUrl(base, rel), POSTER_W, `${info.mtimeMs}:${info.size}`, null, async (page) => {
     const duration = lengthOf(page);
     return { ...(duration != null ? { duration } : {}), width: page.meta.width, height: page.meta.height, ...(page.meta.sized ? {} : { reflows: true }) };
   });
@@ -260,12 +353,13 @@ const lengthOf = (/** @type {FilmPage} */ page) => {
 };
 
 /**
- * `use` the page kept for `url` at `w` px and `version`, one at a time. A page that failed, or never finished a frame,
- * is not kept: the next request opens it fresh.
- * @template T @param {string} url @param {number} w @param {string} version @param {(page: FilmPage) => Promise<T>} use
+ * `use` the page kept for `url` at `w` px and `version` (laid out at `size`, see pageFrame), one at a time. A page that
+ * failed, or never finished a frame, is not kept: the next request opens it fresh.
+ * @template T @param {string} url @param {number} w @param {string} version @param {{ w: number, h: number } | null} size
+ * @param {(page: FilmPage) => Promise<T>} use
  * @returns {Promise<T>}
  */
-function withPage(url, w, version, use) {
+function withPage(url, w, version, size, use) {
   const job = queue.then(async () => {
     if (idle) clearTimeout(idle);
     /** @type {NodeJS.Timeout | undefined} */
@@ -273,14 +367,16 @@ function withPage(url, w, version, use) {
     const late = new Promise((_, fail) => {
       timer = setTimeout(() => { void closeBrowser(); fail(new Error(`drawing ${url.split('/').pop()} took over ${JOB_MS / 1000} s`)); }, JOB_MS);
     });
-    const work = pageFor(url, w, version).then(use);
+    const using = started();
+    const work = pageFor(url, w, version, size).then(use);
     /* given up on, it fails later (its browser closed): heard, so it cannot end the process */
     work.catch(() => {});
     try {
       return await Promise.race([work, late]);
     } catch (e) {
-      forget(url, w, version);
-      throw e;
+      forget(url, w, version, size);
+      /* its browser ended for the memory the page took: said so, not as the browser closing */
+      throw memoryError(await using.catch(() => ({}))) ?? e;
     } finally {
       clearTimeout(timer);
       idle = setTimeout(() => void closeBrowser(), IDLE_MS);
@@ -291,20 +387,23 @@ function withPage(url, w, version, use) {
   return job;
 }
 
+/** The key a page is kept by. @param {string} url @param {number} w @param {string} version @param {{ w: number, h: number } | null} size */
+const keyOf = (url, w, version, size) => `${url}@${w}${size ? `:${size.w}x${size.h}` : ''}#${version}`;
+
 /** Close the page kept for `url` at `w` px and `version`, if one is. */
-function forget(/** @type {string} */ url, /** @type {number} */ w, /** @type {string} */ version) {
-  const key = `${url}@${w}#${version}`;
+function forget(/** @type {string} */ url, /** @type {number} */ w, /** @type {string} */ version, /** @type {{ w: number, h: number } | null} */ size) {
+  const key = keyOf(url, w, version, size);
   const page = open.get(key);
   open.delete(key);
   void page?.then((p) => p.close(), () => {});
 }
 
 /**
- * An open page for `url` at about `w` px wide: kept open while its file is the same `version`, the least recently
- * used one closed past KEEP_PAGES.
+ * An open page for `url` at about `w` px wide (laid out at `size` when it has no size of its own): kept open while its
+ * file is the same `version`, the least recently used one closed past KEEP_PAGES.
  */
-async function pageFor(/** @type {string} */ url, /** @type {number} */ w, /** @type {string} */ version) {
-  const key = `${url}@${w}#${version}`;
+async function pageFor(/** @type {string} */ url, /** @type {number} */ w, /** @type {string} */ version, /** @type {{ w: number, h: number } | null} */ size) {
+  const key = keyOf(url, w, version, size);
   const known = open.get(key);
   if (known) {
     open.delete(key);
@@ -313,12 +412,12 @@ async function pageFor(/** @type {string} */ url, /** @type {number} */ w, /** @
   }
   const refused = unopened.get(key);
   if (refused && Date.now() - refused.at < FAILED_KEPT_MS) throw refused.error;
-  /* a browser that could not start (not downloaded yet on a first run) is tried again next time, not kept */
-  browser ??= launch().catch((e) => { browser = null; throw e; });
+  const starting = started();
   const origin = new URL(url).origin;
-  /* a page is 1920 wide unless it says otherwise; the device scale makes the capture `w` px without a resize */
+  /* a page is 1920 wide (or its clip's size) unless it says otherwise; the device scale makes the capture `w` px
+     without a resize */
   /* on black, as the film shows a page with nothing below it (white, the browser's default, hid a white title) */
-  const opening = (async () => FilmPage.open(await /** @type {Promise<import('playwright-core').Browser>} */ (browser), origin, url, { scale: w / 1920, black: true, waitMs: 15_000, readyMs: FRAME_MS }))();
+  const opening = (async () => FilmPage.open(await starting, origin, url, { scale: w / (size?.w ?? 1920), ...(size ? { size } : {}), black: true, waitMs: 15_000, readyMs: FRAME_MS }))();
   open.set(key, opening);
   opening.catch((e) => {
     open.delete(key);

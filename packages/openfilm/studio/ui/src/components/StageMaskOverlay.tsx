@@ -1,6 +1,6 @@
 /**
  * A mask edited on the picture (the inspector's Mask › Edit on picture): its outline over the clip or layer in hand,
- * turned with it, and CapCut's handles — a press inside moves it (anywhere in the box for a line or a band), the squares
+ * turned with it, and its handles — a press inside moves it (anywhere in the box for a line or a band), the squares
  * resize it, the round knob above turns it, the knob below pulled outward feathers it. The geometry is lib/stage-mask's.
  *
  * A drag shows on the picture as it goes (the session's preview, a frame at a time) and is written once, at the
@@ -9,7 +9,7 @@
  */
 import * as React from 'react';
 
-import { FRAME_BLUE, GestureHint, type FrameGeometry } from '@/components/StageTransformFrame';
+import { FRAME_COLOR, GestureHint, type FrameGeometry } from '@/components/StageTransformFrame';
 import { useT } from '@/i18n';
 import { HEART_D, STAR_D, type Mask } from '@/lib/clip-mask';
 import {
@@ -240,7 +240,7 @@ export function StageMaskOverlay({ frame, session }: {
               cursor: resizeCursor(HANDLE_ANGLE[h.id] + f.r + frame.r),
             }}
           >
-            <span className="block h-[8px] w-[8px] bg-white" style={{ border: `1px solid ${FRAME_BLUE}` }} />
+            <span className="block h-[8px] w-[8px] bg-white" style={{ border: `1px solid ${FRAME_COLOR}` }} />
           </div>
         ))}
         {handles.turn ? <Dot at={handles.turn} size={10} kind="turn" label={t('stageMask.turn')} cursor="grab" /> : null}
@@ -289,8 +289,8 @@ function Dot({ at, size, kind, label, cursor, filled }: { at: P; size: number; k
         style={{
           width: size,
           height: size,
-          background: filled ? FRAME_BLUE : '#fff',
-          border: `1.5px solid ${filled ? '#fff' : FRAME_BLUE}`,
+          background: filled ? FRAME_COLOR : '#fff',
+          border: `1.5px solid ${filled ? '#fff' : FRAME_COLOR}`,
           boxShadow: '0 0 0 0.5px rgba(0,0,0,.25), 0 1px 3px rgba(0,0,0,.3)',
         }}
       />

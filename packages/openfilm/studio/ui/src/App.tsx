@@ -18,6 +18,7 @@ import { Launcher } from './components/Launcher';
 import { studioHost } from './lib/host';
 import { WhatsNew } from './components/WhatsNew';
 import { sourcesApi } from './lib/project-sources';
+import { LIST_WAIT_MS, within } from './lib/projects-page';
 
 /**
  * `to` with this page's key in its address (the server puts it there): the address bar is what a person copies, and
@@ -68,12 +69,13 @@ export function App() {
   useEffect(() => {
     if (id || tabs) return;
     let alive = true;
-    void api.projects().then((projects) => {
+    /* the list not read (refused, or no answer in time): the Projects window, which says so and tries again */
+    void within(api.projects(), LIST_WAIT_MS).then((projects) => {
       if (!alive) return;
       const last = projects.find((p) => !p.missing);
       if (last) go(`/projects/${last.id}`, true);
       else setNone(true);
-    });
+    }, () => { if (alive) setNone(true); });
     return () => { alive = false; setNone(false); };
   }, [id]);
 
@@ -81,7 +83,7 @@ export function App() {
     : tabs ? <Launcher onOpen={open} />
     : !none ? <BrandLoadingScreen labelKey="projects.opening" />
       : (
-        <div className="workspace-shell bg-[var(--dock-shell)]">
+        <div className="workspace-shell bg-[var(--bg-app)]">
           <ProjectsPopover open currentProjectId="" onOpen={(next) => go(`/projects/${next}`)} onCurrentRemoved={() => {}} />
         </div>
       );
@@ -97,18 +99,18 @@ function LockedNotice() {
   const [copied, setCopied] = useState(false);
   const COMMAND = 'openfilm open';
   return (
-    <div role="alert" className="fixed inset-0 z-[10050] flex items-center justify-center bg-[var(--dock-shell)] p-6">
-      <div className="w-full max-w-[460px] rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-[var(--shadow-lg)]">
+    <div role="alert" className="fixed inset-0 z-[10050] flex items-center justify-center bg-[var(--bg-app)] p-6">
+      <div className="w-full max-w-[460px] rounded-2xl border border-[var(--border)] bg-[var(--bg-raised)] p-6 shadow-[var(--shadow-lg)]">
         <p className="text-[16px] font-semibold text-[var(--text)]">{t('connection.lockedTitle')}</p>
         <p className="mt-2 text-[13px] leading-relaxed text-[var(--text-muted)]">{t('connection.lockedBody')}</p>
-        <p className="mt-3 rounded-lg bg-[var(--surface-2)] px-3 py-2 font-mono text-[12px] text-[var(--text-dim)]">{`${location.origin}/open?key=…`}</p>
+        <p className="mt-3 rounded-lg bg-[var(--bg-field)] px-3 py-2 font-mono text-[12px] text-[var(--text-muted)]">{`${location.origin}/open?key=…`}</p>
         {studioHost ? null : (
           <div className="mt-4 flex items-center gap-2 text-[12.5px] text-[var(--text-muted)]">
             <span>{t('connection.lockedHow')}</span>
             <button
               type="button"
               onClick={() => { void navigator.clipboard?.writeText(COMMAND).then(() => setCopied(true), () => {}); }}
-              className="rounded-md bg-[var(--surface-2)] px-2 py-0.5 font-mono text-[12px] text-[var(--text)] ring-1 ring-inset ring-[var(--border)] hover:bg-[var(--bg-hover)]"
+              className="rounded-md bg-[var(--bg-field)] px-2 py-0.5 font-mono text-[12px] text-[var(--text)] ring-1 ring-inset ring-[var(--border)] hover:bg-[var(--bg-hover)]"
             >
               {copied ? t('connection.copied') : COMMAND}
             </button>

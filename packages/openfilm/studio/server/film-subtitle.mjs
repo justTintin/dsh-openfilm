@@ -2,8 +2,10 @@
 /**
  * Subtitle styles: one table, one function, every place that draws them.
  *
- * Subtitles are drawn by Studio, never by the film: the editor lays them over the picture (SubtitleOverlay), and an
- * export burns them in or writes them as SRT / WebVTT / a transcript. Each of those builds its CSS here
+ * Before caption tracks (SPEC §1 Captions), Studio drew a project's subtitles over the picture in a style of its own;
+ * a project from then has them made its caption track as it opens (caption-tracks.mjs `syncSpeechCaptions`), and the
+ * styles here are the looks a caption track can take at once (`subtitleStyleVtt`). An export of such a project not
+ * opened since burns them in or writes them as SRT / WebVTT / a transcript. Each of those builds its CSS here
  * (`filmSubtitleCss`, `filmSubtitleFrameHtml`), so what the person sees while editing is what the export draws. The
  * only legitimate difference is the unit of the font size (the editor follows the window with `cqmin`; an export draws
  * at the frame's pixels), so that one value is passed in.
@@ -61,6 +63,7 @@
  *   karaoke: FilmSubtitleKaraoke | null,
  *   language: string | null,
  *   bilingual: boolean,
+ *   fadeMs: number,
  * }} FilmSubtitleStyle
  */
 
@@ -155,12 +158,20 @@ export const FILM_SUBTITLE_SIZE_PCT_MAX = 10;
  * A ready-made look, like a character style: picking one sets the whole set, and every value can still be changed
  * after. They stay because the combinations that read well are few; built from scratch, subtitles tend to sink into
  * the picture.
- * @typedef {'outline' | 'bar' | 'bold' | 'yellow' | 'clean'} FilmSubtitleLookId
+ * @typedef {'outline' | 'bar' | 'bold' | 'yellow' | 'clean' | 'soft-box' | 'white-box' | 'yellow-box' | 'news' | 'variety' | 'pink'
+ *   | 'blue-edge' | 'gold' | 'block' | 'neon' | 'cinema' | 'type' | 'thin'} FilmSubtitleLookId
  * @typedef {Pick<FilmSubtitleStyle, 'font' | 'fill' | 'stroke' | 'shadow' | 'box'>} FilmSubtitleLook
  */
 
 /** @type {readonly FilmSubtitleLookId[]} */
-export const FILM_SUBTITLE_LOOK_IDS = ['outline', 'bar', 'bold', 'yellow', 'clean'];
+export const FILM_SUBTITLE_LOOK_IDS = [
+  'outline', 'bar', 'bold', 'yellow', 'clean', 'soft-box', 'white-box', 'yellow-box', 'news', 'variety', 'pink', 'blue-edge', 'gold',
+  'block', 'neon', 'cinema', 'type', 'thin',
+];
+
+/** Serif and typewriter stacks for the film and type looks: each platform's own, Chinese, Japanese and Korean included. */
+const SERIF_STACK = '"Songti SC", "Noto Serif SC", "Source Han Serif SC", "SimSun", Georgia, "Times New Roman", serif';
+const TYPE_STACK = 'ui-monospace, Menlo, Consolas, "Courier New", "PingFang SC", "Microsoft YaHei", monospace';
 
 /** @param {Partial<FilmSubtitleFont>} [over] @returns {FilmSubtitleFont} */
 function font(over = {}) {
@@ -221,6 +232,102 @@ export const FILM_SUBTITLE_LOOKS = {
     shadow: { dxEm: 0, dyEm: 0.04, blurEm: 0.2, color: 'rgba(0,0,0,0.62)' },
     box: null,
   },
+  /* a rounded, see-through box: a vlog's */
+  'soft-box': {
+    font: font({ weight: 600 }),
+    fill: '#ffffff',
+    stroke: null,
+    shadow: null,
+    box: { color: '#000000', opacity: 0.38, radiusEm: 0.45, padXEm: 0.6, padYEm: 0.14 },
+  },
+  'white-box': {
+    font: font({ weight: 700 }),
+    fill: '#111111',
+    stroke: null,
+    shadow: null,
+    box: { color: '#ffffff', opacity: 0.95, radiusEm: 0.14, padXEm: 0.45, padYEm: 0.1 },
+  },
+  'yellow-box': {
+    font: font({ weight: 800 }),
+    fill: '#111111',
+    stroke: null,
+    shadow: null,
+    box: { color: '#ffd400', opacity: 1, radiusEm: 0.1, padXEm: 0.45, padYEm: 0.1 },
+  },
+  /* a news bar: white on red, square */
+  news: {
+    font: font({ weight: 700, letterSpacingEm: 0.02 }),
+    fill: '#ffffff',
+    stroke: null,
+    shadow: null,
+    box: { color: '#d81f2a', opacity: 1, radiusEm: 0, padXEm: 0.5, padYEm: 0.12 },
+  },
+  /* a variety show's: yellow letters, a red edge, a hard shadow */
+  variety: {
+    font: font({ weight: 900, letterSpacingEm: 0.02 }),
+    fill: '#ffe14d',
+    stroke: { widthEm: 0.1, color: '#e8263f' },
+    shadow: { dxEm: 0.04, dyEm: 0.07, blurEm: 0, color: 'rgba(60,0,10,0.85)' },
+    box: null,
+  },
+  pink: {
+    font: font({ weight: 900, letterSpacingEm: 0.02 }),
+    fill: '#ff5fa2',
+    stroke: { widthEm: 0.09, color: '#ffffff' },
+    shadow: { dxEm: 0, dyEm: 0.06, blurEm: 0.12, color: 'rgba(120,0,60,0.55)' },
+    box: null,
+  },
+  'blue-edge': {
+    font: font({ weight: 800, letterSpacingEm: 0.02 }),
+    fill: '#ffffff',
+    stroke: { widthEm: 0.09, color: '#1f6bff' },
+    shadow: { dxEm: 0, dyEm: 0.05, blurEm: 0.1, color: 'rgba(0,20,80,0.6)' },
+    box: null,
+  },
+  gold: {
+    font: font({ weight: 800, letterSpacingEm: 0.03 }),
+    fill: '#ffd77a',
+    stroke: { widthEm: 0.07, color: '#4a2c00' },
+    shadow: { dxEm: 0, dyEm: 0.05, blurEm: 0.14, color: 'rgba(0,0,0,0.6)' },
+    box: null,
+  },
+  /* heavy letters lifted off the picture by a hard shadow below them */
+  block: {
+    font: font({ weight: 900, letterSpacingEm: 0.01 }),
+    fill: '#ffffff',
+    stroke: { widthEm: 0.06, color: '#111111' },
+    shadow: { dxEm: 0.05, dyEm: 0.08, blurEm: 0, color: '#111111' },
+    box: null,
+  },
+  neon: {
+    font: font({ weight: 600, letterSpacingEm: 0.06 }),
+    fill: '#f2feff',
+    stroke: null,
+    shadow: { dxEm: 0, dyEm: 0, blurEm: 0.35, color: '#00e1ff' },
+    box: null,
+  },
+  /* a film's: serif, spaced, a soft shadow */
+  cinema: {
+    font: font({ family: SERIF_STACK, weight: 400, letterSpacingEm: 0.08 }),
+    fill: '#f3efe4',
+    stroke: null,
+    shadow: { dxEm: 0, dyEm: 0.04, blurEm: 0.25, color: 'rgba(0,0,0,0.75)' },
+    box: null,
+  },
+  type: {
+    font: font({ family: TYPE_STACK, weight: 500, letterSpacingEm: 0.02 }),
+    fill: '#ffffff',
+    stroke: null,
+    shadow: null,
+    box: { color: '#000000', opacity: 0.8, radiusEm: 0.04, padXEm: 0.35, padYEm: 0.08 },
+  },
+  thin: {
+    font: font({ weight: 300, letterSpacingEm: 0.12 }),
+    fill: '#ffffff',
+    stroke: null,
+    shadow: { dxEm: 0, dyEm: 0.03, blurEm: 0.18, color: 'rgba(0,0,0,0.55)' },
+    box: null,
+  },
 };
 
 /**
@@ -239,6 +346,7 @@ export const FILM_SUBTITLE_DEFAULT = {
   karaoke: null,
   language: null,
   bilingual: false,
+  fadeMs: 0,
 };
 
 /**
@@ -641,12 +749,27 @@ export function parseFilmSubtitleStyle(raw) {
     })),
     language: isFilmSubtitleLanguage(v.language) ? v.language : null,
     bilingual: bool(v.bilingual, false),
+    fadeMs: num(v.fadeMs, base.fadeMs, 0, 1000),
   };
 }
 
 /* ── for an export ───────────────────────────────────────────────────────── */
 
 const escapeHtml = (/** @type {string} */ s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+/**
+ * How far a line has faded in or out at a moment: 1 when it is whole, 0 when it is not drawn yet or gone. The line
+ * fades in over `fadeMs` from its start and out over the same time before its end; a line shorter than twice that
+ * fades for half its length each way. Off (`fadeMs` 0): always 1.
+ * @param {{ startMs: number, durMs: number }} cue @param {number} timeMs @param {number} fadeMs
+ */
+export function filmSubtitleOpacity(cue, timeMs, fadeMs) {
+  const fade = Math.min(fadeMs, cue.durMs / 2);
+  if (!(fade > 0)) return 1;
+  const inward = (timeMs - cue.startMs) / fade;
+  const outward = (cue.startMs + cue.durMs - timeMs) / fade;
+  return Math.max(0, Math.min(1, inward, outward));
+}
 
 /**
  * The subtitle layer of one frame, for an export that burns subtitles in: an HTML fragment to lay over the picture.
@@ -676,8 +799,9 @@ export function filmSubtitleFrameHtml(cues, style, frame, timeMs) {
       ? `<span style="${escapeHtml(filmSubtitleCssText(filmSubtitleWordCss(fitted)))}">${escapeHtml(w.text)}</span>`
       : escapeHtml(w.text))).join('')
     : escapeHtml(filmSubtitleText(cue));
+  const opacity = filmSubtitleOpacity(cue, timeMs, fitted.fadeMs);
   return `<div style="position:absolute;left:0;top:0;width:${frame.w}px;height:${frame.h}px;overflow:hidden;pointer-events:none">`
-    + `<div style="${escapeHtml(filmSubtitleCssText(css.box))}"><span style="${escapeHtml(filmSubtitleCssText(css.text))}">${body}</span></div></div>`;
+    + `<div style="${escapeHtml(filmSubtitleCssText(opacity < 1 ? { ...css.box, opacity: String(opacity) } : css.box))}"><span style="${escapeHtml(filmSubtitleCssText(css.text))}">${body}</span></div></div>`;
 }
 
 /* ── files ───────────────────────────────────────────────────────────────── */
@@ -695,7 +819,7 @@ function srtStamp(ms) {
  * players disagree on overlaps). Cut, not dropped: the dropped line was really said.
  * @param {readonly FilmSubtitleCue[]} cues
  */
-function sequencedCues(cues) {
+export function filmSubtitleSequence(cues) {
   const sorted = [...cues].filter((c) => c.text.trim() && c.durMs > 0).sort((a, b) => a.startMs - b.startMs);
   /** @type {{ cue: FilmSubtitleCue, end: number }[]} */
   const out = [];
@@ -714,18 +838,21 @@ function sequencedCues(cues) {
  * @param {readonly FilmSubtitleCue[]} cues
  */
 export function filmSubtitleSrt(cues) {
-  const blocks = sequencedCues(cues).map(({ cue, end }, i) => {
+  const blocks = filmSubtitleSequence(cues).map(({ cue, end }, i) => {
     const line = cue.speaker ? `${cue.speaker}:${cue.text}` : cue.text;
     return `${i + 1}\n${srtStamp(cue.startMs)} --> ${srtStamp(end)}\n${line.trim()}`;
   });
   return blocks.length ? `${blocks.join('\n\n')}\n` : '';
 }
 
+/** `&`, `<` and `>` as VTT's escapes: a raw `<` starts a tag, `&` an escape, and `-->` would end the cue's timing. */
+const escapeVtt = (/** @type {string} */ s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
 /** A WebVTT file; the speaker as `<v name>`, VTT's own voice tag. @param {readonly FilmSubtitleCue[]} cues */
 export function filmSubtitleVtt(cues) {
-  const blocks = sequencedCues(cues).map(({ cue, end }) => {
-    const text = cue.text.trim().replace(/-->/g, '→');
-    const line = cue.speaker ? `<v ${cue.speaker.replace(/[<>]/g, '')}>${text}` : text;
+  const blocks = filmSubtitleSequence(cues).map(({ cue, end }) => {
+    const text = escapeVtt(cue.text.trim());
+    const line = cue.speaker ? `<v ${escapeVtt(cue.speaker)}>${text}` : text;
     return `${srtStamp(cue.startMs).replace(',', '.')} --> ${srtStamp(end).replace(',', '.')}\n${line}`;
   });
   return blocks.length ? `WEBVTT\n\n${blocks.join('\n\n')}\n` : '';
@@ -737,7 +864,7 @@ export function filmSubtitleTranscript(cues) {
   const lines = [];
   /** @type {string | undefined} */
   let lastSpeaker;
-  for (const { cue } of sequencedCues(cues)) {
+  for (const { cue } of filmSubtitleSequence(cues)) {
     if (lines.length && cue.speaker !== lastSpeaker) lines.push('');
     lines.push(cue.speaker && cue.speaker !== lastSpeaker ? `${cue.speaker}:${cue.text.trim()}` : cue.text.trim());
     lastSpeaker = cue.speaker;
@@ -761,4 +888,56 @@ export function filmSubtitleCuesInRange(cues, fromMs, toMs) {
     out.push({ ...cue, startMs: start - fromMs, durMs: end - start });
   }
   return out;
+}
+
+/** Cues for selected stretches joined in list order, each moved to its position in the result.
+ * @template {FilmSubtitleCue} T
+ * @param {readonly T[]} cues @param {readonly (readonly [number, number])[]} ranges @returns {T[]}
+ */
+export function filmSubtitleCuesInRanges(cues, ranges) {
+  let offset = 0;
+  return ranges.flatMap(([from, to]) => {
+    const part = filmSubtitleCuesInRange(cues, from, to).map((cue) => ({ ...cue, startMs: cue.startMs + offset }));
+    offset += to - from;
+    return part;
+  });
+}
+
+/* ── a style as a caption track says it (SPEC §1 Captions) ───────────────── */
+
+const rgbaOf = (/** @type {string} */ color, /** @type {number} */ alpha) => {
+  const m = /^#([0-9a-f]{6})$/i.exec(color);
+  if (!m) return color;
+  const n = parseInt(m[1], 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${Math.round(alpha * 100) / 100})`;
+};
+
+/**
+ * A subtitle style (film-subtitle.mjs) as a caption track says it: a REGION where its lines sit (its place, as wide as
+ * it lets them be), and STYLE CSS for how they look. The size is a share of the frame's short side (`cqmin`), as the
+ * style's is; the word being said (karaoke) becomes the words said so far (`:past`).
+ * @param {import('./film-subtitle.mjs').FilmSubtitleStyle} style
+ * @returns {{ region: string, css: string, align: string }}
+ */
+export function subtitleStyleVtt(style) {
+  const f = style.font;
+  const anchor = style.pos.y > 0.55 ? 100 : style.pos.y < 0.45 ? 0 : 50;
+  const pct = (/** @type {number} */ n) => `${Math.round(n * 1000) / 10}%`;
+  const region = [
+    'id:main', `width:${Math.round(style.maxWidthPct)}%`, 'lines:3',
+    `regionanchor:50%,${anchor}%`, `viewportanchor:${pct(style.pos.x)},${pct(style.pos.y)}`,
+  ].join('\n');
+  const cue = [
+    `font: ${f.italic ? 'italic ' : ''}${f.weight} ${f.sizePct}cqmin/${f.lineHeight} ${cssFontFamily(f.family)}`,
+    `color: ${style.fill}`,
+    style.box ? `background: ${rgbaOf(style.box.color, style.box.opacity)}` : 'background: none',
+    ...(style.box ? [`padding: ${style.box.padYEm}em ${style.box.padXEm}em`, `border-radius: ${style.box.radiusEm}em`] : []),
+    ...(style.stroke && style.stroke.widthEm > 0 ? [`-webkit-text-stroke: ${style.stroke.widthEm}em ${style.stroke.color}`, 'paint-order: stroke fill'] : []),
+    ...(style.shadow ? [`text-shadow: ${style.shadow.dxEm}em ${style.shadow.dyEm}em ${style.shadow.blurEm}em ${style.shadow.color}`] : []),
+    ...(f.letterSpacingEm ? [`letter-spacing: ${f.letterSpacingEm}em`] : []),
+    ...(f.upper ? ['text-transform: uppercase'] : []),
+  ];
+  const lines = [`::cue { ${cue.join('; ')}; }`];
+  if (style.karaoke) lines.push(`::cue(:past) { color: ${style.karaoke.color}; }`);
+  return { region, css: lines.join('\n'), align: style.align };
 }

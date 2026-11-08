@@ -1,7 +1,7 @@
 import { test as it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { FilmOverride } from './film.ts';
-import { changedImage, changedText, changedVar, cssUrl, fieldOf, isFontVar, labelOf, relativeTo, urlOf, valueOf, withImage, withText, withVar } from './template-controls.ts';
+import { changedImage, changedText, changedVar, cssUrl, fieldOf, isFontVar, labelOf, pathIsAt, pictureStyle, relativeTo, urlOf, valueOf, withImage, withText, withVar } from './template-controls.ts';
 
 it('a custom property is changed as a color, a number with its unit, words, or as typed', () => {
   assert.deepEqual(fieldOf('#ff5746'), { kind: 'color', value: '#ff5746' });
@@ -69,6 +69,11 @@ it('a picture put in a page is named from the page\'s folder, as CSS writes a ur
   assert.equal(urlOf("url('x.png')"), 'x.png');
   assert.equal(urlOf('url(x.png)'), 'x.png');
   assert.equal(urlOf('none'), null);
+  assert.equal(urlOf('url("a\\"b.png")'), 'a"b.png');
+  const open = Date.now();
+  assert.equal(urlOf(`url("${'\\!'.repeat(40)}`), null);
+  assert.equal(urlOf(`url('${'\\&'.repeat(40)}`), null);
+  assert.ok(Date.now() - open < 100, 'a quote left open fails at once');
 });
 
 it('a picture is replaced with the CSS that draws another file in its place: content for an <img>, a background for a box', () => {
@@ -91,4 +96,22 @@ it('a custom property that names a font gets the font picker', () => {
   assert.equal(isFontVar('--font-size', '48px'), false);
   assert.equal(isFontVar('--font-color', '#fff'), false);
   assert.equal(isFontVar('--accent', 'Inter'), false);
+});
+
+it('a picture on the picture is replaced by the same style the Content section writes: an <img> by content, a box by its background', () => {
+  assert.deepEqual(pictureStyle('img', '../assets/new.png'), { content: 'url("../assets/new.png")' });
+  assert.deepEqual(pictureStyle('bg', 'bg.jpg'), { backgroundImage: 'url("bg.jpg")' });
+  assert.deepEqual(pictureStyle('img', null), { content: null }, 'its own again');
+  const logo = { at: '#logo', kind: 'img' as const };
+  assert.equal(changedImage([{ at: '#logo', style: pictureStyle('img', 'x.png') as Record<string, string> }], logo), 'x.png');
+});
+
+it('a page\'s words named by their path are what a property names by its tags and classes', () => {
+  assert.equal(pathIsAt('body > div.w > div.t', '.t'), true);
+  assert.equal(pathIsAt('body > div.w.low > div.t > span.x', '.t > .x'), true);
+  assert.equal(pathIsAt('body > div.w > div.t > span.s', '.t > .x'), false);
+  assert.equal(pathIsAt('body > div.w > p.t1:nth-of-type(2)', 'p.t1'), true);
+  assert.equal(pathIsAt('body > div.w > div.t', 'span.t'), false);
+  assert.equal(pathIsAt('#title', '.t'), false);
+  assert.equal(pathIsAt('body > div.w > div.t', '[data-x]'), false);
 });

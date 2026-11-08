@@ -23,13 +23,16 @@ import { createHash, createHmac } from 'node:crypto';
 import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { mkdir, rename } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { basename, dirname, isAbsolute, join, normalize, relative, sep } from 'node:path';
-import { HOST_FLAG, folderFiles } from '../../src/host.mjs';
+import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
+import { HOST_FLAG, folderFiles, listenLocal } from '../../src/host.mjs';
 import { readableLink } from '../../src/media-links.mjs';
 import { clipKind } from '../../src/film-doc.mjs';
 import { readPrefs } from './prefs.mjs';
-import { readyProxy } from './proxies.mjs';
+import { readyProxy, undecodable } from './proxies.mjs';
+import { madeCopy } from '../../src/seekable.mjs';
+import { isPreviewKey, previewDir } from './preview-cache.mjs';
 import { soundOf } from './derived.mjs';
+import { compoundOuter } from './parts.mjs';
 
 const BRIDGE = readFileSync(new URL('./bridge.js', import.meta.url), 'utf8');
 
@@ -70,6 +73,12 @@ async function playableCopy(root, rel) {
   return made;
 }
 const STAGE = readFileSync(new URL('./stage.js', import.meta.url), 'utf8');
+/*
+ * A page in the preview's film draws at the pixels the viewer shows it at: its devicePixelRatio is the one the editor
+ * put in the film's address (`film-dpr`, editor/Preview.tsx), so a canvas sized by it (SPEC §3) is no larger than what is
+ * seen. The film's own videos and pictures, and every page drawn for an export, are as the screen is.
+ */
+const PAGE_SCALE = `(()=>{try{if(parent===window)return;const k=Number(new URL(parent.location.href).searchParams.get('film-dpr'));if(k>0)Object.defineProperty(window,'devicePixelRatio',{configurable:true,get:()=>k})}catch{}})();`;
 
 /**
  * Whether a request was addressed to this machine at `port` by name (its Host): another site whose name is made to
@@ -121,14 +130,17 @@ export async function startPages({ port, editorOrigin, secret, projects }) {
   /* the timeline page (the preview) gets the bridge and the stage; a web page gets the bridge too, so the editor can
      play one on its own (the media pane's viewer) — inside the timeline it stays quiet: its parent is not the editor */
   const filesOf = (/** @type {string} */ root) => folderFiles(root, {
-    inject: `<script>${HOST_FLAG}</script>${scripts(BRIDGE)}`,
+    inject: `<script>${HOST_FLAG}${PAGE_SCALE}</script>${scripts(BRIDGE)}`,
     timelineInject: `<script>${HOST_FLAG}</script>${scripts(BRIDGE, STAGE)}`,
     headers: policy(),
-    /* heavy footage is played from its proxy once it is made, while proxies are on (proxies.mjs): the preview only */
+    /* heavy footage is played from its proxy once it is made, while proxies are on, and footage the editor's browser
+       does not decode whether they are or not (proxies.mjs); else from a copy made for footage a render's browser does
+       not decode, or that seeks slowly (src/seekable.mjs), when there is one */
     swap: (file) => {
       if (clipKind(file) !== 'video') return null;
       const { proxies } = readPrefs();
-      return proxies.on ? readyProxy(root, relative(root, file).split(sep).join('/'), proxies.height) : null;
+      const rel = relative(root, file).split(sep).join('/');
+      return (proxies.on || undecodable(root, rel) ? readyProxy(root, rel, proxies.height) : null) ?? madeCopy(file, root);
     },
   });
 
@@ -138,11 +150,20 @@ export async function startPages({ port, editorOrigin, secret, projects }) {
   /** @type {Map<string, { root: string, files: ReturnType<typeof folderFiles> }>} */
   const byToken = new Map();
   const tokenOf = (/** @type {string} */ id) => createHmac('sha256', secret).update(`film origin\0${id}`).digest().subarray(0, 18).toString('base64url');
-  /** The project's token, pointing at its folder as it is now (a renamed folder keeps its token). */
+  /**
+   * The project's token, pointing at its folder as it is now (a renamed folder keeps its token). A compound clip's film
+   * (parts.mjs) is served from the project it is in, whose files it names (`../../assets/a.mp4`).
+   */
   const serve = (/** @type {{ id: string, path: string }} */ project) => {
     const token = tokenOf(project.id);
-    if (byToken.get(token)?.root !== project.path) byToken.set(token, { root: project.path, files: filesOf(project.path) });
+    const root = compoundOuter(project.path);
+    if (byToken.get(token)?.root !== root) byToken.set(token, { root, files: filesOf(root) });
     return token;
+  };
+  /** Where the project's folder is in what its token serves: nothing, or a compound clip's `parts/<name>/`. */
+  const within = (/** @type {string} */ path) => {
+    const sub = relative(compoundOuter(path), resolve(path)).split(sep).join('/');
+    return sub ? `${sub}/` : '';
   };
   /** The folder a token reaches: one served since this launch, else the listed project it is the token of. */
   const entryOf = async (/** @type {string} */ token) => {
@@ -175,6 +196,13 @@ export async function startPages({ port, editorOrigin, secret, projects }) {
       if (!folderFiles(dirname(file), { headers: policy() })(req, res, `/${basename(file)}`, url.searchParams)) res.writeHead(403, headers).end();
       return;
     }
+    /* a stretch of the film rendered for the preview to play in its place (preview-cache.mjs): its cache, not the
+       project's files */
+    const render = /^\/__film\/preview\/([0-9a-f]+)\.mp4$/.exec(plain);
+    if (render && isPreviewKey(render[1])) {
+      if (!folderFiles(previewDir(entry.root), { headers: policy() })(req, res, `/${render[1]}.mp4`, url.searchParams)) res.writeHead(403, headers).end();
+      return;
+    }
     if (UNPLAYABLE.test(plain)) {
       const copy = await playableCopy(entry.root, plain.replace(/^\/+/, ''));
       if (!copy) { res.writeHead(404, headers).end('not found'); return; }
@@ -183,7 +211,7 @@ export async function startPages({ port, editorOrigin, secret, projects }) {
     }
     if (!entry.files(req, res, path, url.searchParams)) res.writeHead(403, headers).end();
   });
-  await new Promise((done, fail) => { server.once('error', fail); server.listen(port, '127.0.0.1', () => done(undefined)); });
+  await listenLocal(server, port);
   /* named `localhost`, not 127.0.0.1 as the editor is: another site to the browser, not only another origin, so it puts
      the film (footage decoding, pages drawing) in a process of its own, away from the editor's */
   const origin = `http://localhost:${/** @type {import('node:net').AddressInfo} */ (server.address()).port}`;
@@ -191,7 +219,7 @@ export async function startPages({ port, editorOrigin, secret, projects }) {
   return {
     origin,
     /** The address of a project's folder on the film's origin; a renamed folder keeps it (pass the project as it is now). */
-    folderUrl: (/** @type {{ id: string, path: string }} */ project) => `${origin}/p/${serve(project)}/`,
+    folderUrl: (/** @type {{ id: string, path: string }} */ project) => `${origin}/p/${serve(project)}/${within(project.path)}`,
     close: () => new Promise((done) => { server.closeAllConnections(); server.close(() => done(undefined)); }),
   };
 }

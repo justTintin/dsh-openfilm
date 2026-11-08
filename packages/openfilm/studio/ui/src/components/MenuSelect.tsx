@@ -3,7 +3,7 @@
  * checked), in place of the browser's own list: that one is drawn by the system, light in a dark Studio, and with
  * the field's text color it read as if every choice were disabled. Choices may come in groups, each under a small
  * heading. The arrow keys move through them, Enter picks, Esc closes. With `onPreview`, the choice under the pointer (or
- * the keys) is shown before it is picked, as Figma shows a font or a blend mode on the canvas; closing without a pick
+ * the keys) is shown on the picture before it is picked (a font, a blend mode); closing without a pick
  * takes it back (`onRevert`).
  */
 import React from 'react';
@@ -14,7 +14,7 @@ export type MenuChoice = { value: string; label: string };
 export type MenuGroup = { label?: string; choices: MenuChoice[] };
 
 export function MenuSelect({
-  label, value, groups, onPick, onPreview, onRevert, disabled = false, className = '', size = 'sm', prefix,
+  label, value, groups, onPick, onPreview, onRevert, disabled = false, className = '', size = 'sm', prefix, menuWidth = 'trigger',
 }: {
   /** what it chooses, for screen readers (the field shows the choice) */
   label: string;
@@ -31,6 +31,8 @@ export function MenuSelect({
   size?: 'sm' | 'md';
   /** A word before the choice (Blend), as the inspector's other fields have their mark. */
   prefix?: string;
+  /** Long choices can size the open menu independently of a compact field. */
+  menuWidth?: 'trigger' | 'content';
 }) {
   const [open, setOpen] = React.useState(false);
   const [width, setWidth] = React.useState(0);
@@ -54,7 +56,7 @@ export function MenuSelect({
     if (!open && previewing.current) { previewing.current = false; onRevert?.(); }
   }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  /* opened: as wide as the field, the chosen one in view and lit for the keys */
+  /* opened: at least as wide as the field, the chosen one in view and lit for the keys */
   React.useLayoutEffect(() => {
     if (!open) return;
     setWidth(triggerRef.current?.getBoundingClientRect().width ?? 0);
@@ -108,7 +110,7 @@ export function MenuSelect({
         /* the popover keeps focus where it was on a press: the keys need it here */
         onClick={(e) => e.currentTarget.focus()}
         onKeyDown={onKeyDown}
-        className={`flex min-w-0 flex-1 items-center gap-1.5 border border-[var(--border)] bg-[var(--fill-tsp)] text-left text-[var(--text)] ${size === 'md' ? 'h-9 rounded-lg pl-3 pr-2 text-[13px]' : 'h-7 rounded-md pl-2 pr-1.5 text-[11px]'} outline-none transition hover:border-[var(--text-faint)] focus-visible:border-[var(--accent)] disabled:opacity-50 ${open ? 'border-[var(--accent)]' : ''} ${className}`}
+        className={`flex min-w-0 flex-1 items-center gap-1.5 border border-[var(--border)] bg-[var(--bg-field)] text-left text-[var(--text)] ${size === 'md' ? 'h-9 rounded-lg pl-3 pr-2 text-[13px]' : 'h-7 rounded-md pl-2 pr-1.5 text-[11px]'} outline-none transition hover:border-[var(--text-faint)] focus-visible:border-[var(--accent)] disabled:opacity-50 ${open ? 'border-[var(--accent)]' : ''} ${className}`}
       >
         {prefix ? <span className="shrink-0 whitespace-nowrap text-[10.5px] text-[var(--text-faint)]">{prefix}</span> : null}
         <span className="min-w-0 flex-1 truncate">{current?.label ?? value}</span>
@@ -122,8 +124,13 @@ export function MenuSelect({
         aria-label={label}
         onKeyDown={onKeyDown}
         onMouseLeave={() => show(undefined)}
-        className="relative overflow-y-auto rounded-[8px] border border-[var(--border)] bg-[var(--panel)] p-1 shadow-[var(--shadow-lg)]"
-        style={{ width: Math.max(width, 160), maxHeight: 'min(320px, var(--popover-max-h, 320px))' }}
+        className="relative overflow-y-auto rounded-[8px] border border-[var(--border)] bg-[var(--bg-raised)] p-1 shadow-[var(--shadow-lg)]"
+        style={{
+          width: menuWidth === 'content' ? 'max-content' : Math.max(width, 160),
+          minWidth: Math.max(width, 160),
+          maxWidth: 'calc(100vw - 24px)',
+          maxHeight: 'min(320px, var(--popover-max-h, 320px))',
+        }}
       >
         {groups.map((group, g) => (
           <div key={group.label ?? g} role="group" aria-label={group.label}>

@@ -4,9 +4,9 @@
  * file projects in folders of the list; or, switched to "Examples", to start from an example (ExamplesGallery). Its
  * projects are ProjectsView; this file holds the data and actions.
  *
- * Studio's projects are folders on disk: deleting one moves its folder to the system's Trash. One whose folder is gone
- * (moved, renamed or deleted outside Studio: `missing`) cannot be opened; it can be located (the folder it is in now)
- * or taken off the list.
+ * Studio's projects are folders on disk: deleting one moves its folder to the system's Trash. One whose folder or film
+ * file is gone (`missing`) cannot be opened; it can be located (the folder it is in now) or taken off the list,
+ * preserving any remaining files.
  *
  * A folder is picked with the app's own dialog where there is an app (lib/host.ts `folders`), else with Studio's
  * folder browser; one without a film is opened only once the person agrees to start a film in it.
@@ -18,26 +18,35 @@
 import React from 'react';
 import { createPortal } from 'react-dom';
 import { Loader2 } from 'lucide-react';
-import { api, ApiError } from '@/api';
+import { api, ApiError, LIBRARY_EVENT } from '@/api';
+import { recycleRefusalOf, recycleRefusalWords, type RecycleRefusal } from '@/lib/recycle';
 import { useT } from '@/i18n';
-import { folderApi, folderCounts, folderTrail, type ProjectFolder } from '@/lib/project-folders';
+import { folderApi, folderCounts, folderTrail, newProjectIn, type ProjectFolder } from '@/lib/project-folders';
+import { stillThere } from '@/lib/project-delete';
 import { studioHost } from '@/lib/host';
-import { SourceError, sourcesApi } from '@/lib/project-sources';
+import { SourceError, sourcesApi, type Example } from '@/lib/project-sources';
+import { LIST_WAIT_MS, within } from '@/lib/projects-page';
+import { readLastSubtitleStyle } from '@/lib/subtitles';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ProjectsView, type LibraryProject } from './ProjectsView';
 import { FolderBrowserDialog, GitHubDialog } from './ProjectSources';
-import { ExamplesGallery, TitleSwitch } from './ExamplesGallery';
+import { ExamplesGallery, TitleSwitch, type ExamplePart } from './ExamplesGallery';
+import { ProjectCoverContext, posterUrl, useProjectCover } from './ProjectCover';
+import { LARGE_DIALOG_SIZE } from './dialog-chrome';
 
 
-/* each card's picture: the film's middle frame, drawn by Studio (cached until film.html changes); none for a project
-   whose folder is gone (its card shows its color) */
-const posterOf = (p: LibraryProject) => (p.missing ? undefined : `/api/projects/${encodeURIComponent(p.id)}/poster`);
+/* each card's picture: its own cover, else the film's middle frame, drawn by Studio (cached until film.html changes);
+   none for a project whose folder is gone (its card shows its color) */
+const posterOf = (p: LibraryProject) => (p.missing ? undefined : posterUrl(p));
 
 function useProjectLibrary(open: boolean) {
   const t = useT();
   const [projects, setProjects] = React.useState<LibraryProject[]>([]);
   const [folders, setFolders] = React.useState<ProjectFolder[]>([]);
   const [loaded, setLoaded] = React.useState(false);
+  /** the list could not be read (Studio refused, or did not answer in time): said, with a way to try again */
+  const [loadFailed, setLoadFailed] = React.useState(false);
+  const [tries, setTries] = React.useState(0);
   const [error, setError] = React.useState<string | null>(null);
   const errorTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   React.useEffect(() => () => { if (errorTimer.current) clearTimeout(errorTimer.current); }, []);
@@ -48,24 +57,59 @@ function useProjectLibrary(open: boolean) {
     errorTimer.current = setTimeout(() => setError(null), 4000);
   }, []);
 
-  /* fetched fresh on every open: the agent or another window may have made or removed one meanwhile */
+  /* Read on open and when coming back to it (focus, shown again), as returning from Finder. External changes need no
+     app restart, and a slow refresh never overlaps the next one or hides the list already shown. Opening a card
+     checks that project again (openListed). */
   React.useEffect(() => {
     if (!open) return undefined;
     let alive = true;
-    void Promise.all([
-      api.projects().then(
-        (list) => { if (alive) setProjects(list.map((p) => ({ ...p, poster: posterOf(p) }))); },
-        () => {},
-      ),
-      folderApi.list().then((list) => { if (alive) setFolders(list); }, () => {}),
-    ]).then(() => { if (alive) setLoaded(true); });
-    return () => { alive = false; };
-  }, [open]);
+    let loading = false;
+    setLoadFailed(false);
+    const refresh = () => {
+      if (!alive || loading) return;
+      loading = true;
+      void Promise.all([within(api.projects(), LIST_WAIT_MS), within(folderApi.list(), LIST_WAIT_MS)]).then(
+        ([list, folderList]) => {
+          if (!alive) return;
+          setProjects(list.map((p) => ({ ...p, poster: posterOf(p) })));
+          setFolders(folderList);
+          setLoaded(true);
+          setLoadFailed(false);
+        },
+        () => { if (alive) setLoadFailed(true); },
+      ).finally(() => { loading = false; });
+    };
+    const visible = () => { if (document.visibilityState === 'visible') refresh(); };
+    refresh();
+    window.addEventListener('focus', visible);
+    document.addEventListener('visibilitychange', visible);
+    return () => { alive = false; window.removeEventListener('focus', visible); document.removeEventListener('visibilitychange', visible); };
+  }, [open, tries]);
+  const retryLoad = React.useCallback(() => setTries((n) => n + 1), []);
 
   const reloadFolders = React.useCallback(() => {
     void folderApi.list().then(setFolders, () => {});
-    void api.projects().then((list) => setProjects((cur) => list.map((p) => ({ ...p, poster: cur.find((c) => c.id === p.id)?.poster ?? posterOf(p) }))), () => {});
+    /* a card keeps the picture it shows, unless its cover changed meanwhile (from the editor, or another window) */
+    void api.projects().then((list) => setProjects((cur) => list.map((p) => {
+      const shown = cur.find((c) => c.id === p.id);
+      return { ...p, poster: shown && shown.cover === p.cover ? shown.poster ?? posterOf(p) : posterOf(p) };
+    })), () => {});
   }, []);
+
+  /** A project's cover set or taken off (null): its card asks for its picture again. */
+  const coverChanged = React.useCallback((id: string, cover: number | null) => {
+    setProjects((list) => list.map((p) => {
+      if (p.id !== id) return p;
+      const next = { ...p, cover: cover ?? undefined };
+      return { ...next, poster: posterOf(next) };
+    }));
+  }, []);
+  /* the library moved (Settings): its projects, where they are now */
+  React.useEffect(() => {
+    if (!open) return undefined;
+    window.addEventListener(LIBRARY_EVENT, reloadFolders);
+    return () => window.removeEventListener(LIBRARY_EVENT, reloadFolders);
+  }, [open, reloadFolders]);
 
   /**
    * How many of `ids` an agent is working in right now, read afresh (an agent may have started or finished since the
@@ -88,13 +132,21 @@ function useProjectLibrary(open: boolean) {
     const drop = new Set(ids);
     setProjects((list) => list.filter((p) => !drop.has(p.id)));
     /* null: deleted; else why not ('agent-running': an agent started in it since the list was read) */
-    const results = await Promise.all(ids.map((id) => api.forget(id).then(() => null, (e: unknown) => ({ id, working: e instanceof ApiError && e.body.code === 'agent-running' }))));
-    const failed = results.filter((r): r is { id: string; working: boolean } => r !== null);
+    /* `lost`: no answer came (the request was cut off, as when the page showing one of them leaves it) */
+    /* `kept` (Windows): the Recycle Bin would not take its folder, so it stays where it is, and the person hears why */
+    const results = await Promise.all(ids.map((id) => api.forget(id).then(() => null, (e: unknown) => ({
+      id, working: e instanceof ApiError && e.body.code === 'agent-running', lost: !(e instanceof ApiError),
+      kept: e instanceof ApiError ? recycleRefusalOf(e.body) : null,
+    }))));
+    /* the ones still on the list (lib/project-delete): one gone already, or whose lost answer was a delete, was deleted */
+    const failed = await stillThere(results.filter((r): r is { id: string; working: boolean; lost: boolean; kept: RecycleRefusal | null } => r !== null),
+      () => api.projects().then((list) => list.map((p) => p.id)));
     if (failed.length) {
       const back = new Set(failed.map((f) => f.id));
       setProjects((list) => [...list, ...before.filter((p) => back.has(p.id)).map((p) => (failed.find((f) => f.id === p.id)?.working ? { ...p, working: true } : p))]);
       const working = failed.filter((f) => f.working).length;
-      flash(working ? agentRunning(working, ids.length) : t('project.deleteFailed'));
+      const kept = failed.find((f) => f.kept)?.kept;
+      flash(working ? agentRunning(working, ids.length) : kept ? recycleRefusalWords(t, kept) : t('project.deleteFailed'));
     }
     const gone = new Set(failed.map((f) => f.id));
     return new Set(ids.filter((id) => !gone.has(id)));
@@ -108,6 +160,15 @@ function useProjectLibrary(open: boolean) {
     } catch {
       return null;
     }
+  }
+
+  /** A folder into another (null: the top level), with what it holds. */
+  function moveFolder(id: string, parentId: string | null) {
+    setFolders((list) => list.map((f) => (f.id === id ? { ...f, parentId: parentId ?? undefined } : f)));
+    folderApi.moveFolder(id, parentId).then(
+      (folder) => setFolders((list) => list.map((f) => (f.id === id ? folder : f))),
+      () => reloadFolders(),
+    );
   }
 
   function renameFolder(id: string, name: string) {
@@ -150,20 +211,28 @@ function useProjectLibrary(open: boolean) {
       const renamed = await api.rename(id, name);
       /* the server cleans the name for the file system: show what the folder is really called */
       setProjects((list) => list.map((p) => (p.id === id ? { ...p, ...renamed } : p)));
+      /* its tab says the new name, also while that tab has no page to say it */
+      const tab = (await studioHost?.tabs?.list().catch(() => null))?.tabs.find((x) => x.projectId === id);
+      if (tab) void studioHost?.tabs?.retitle?.(tab.id, renamed.name);
     } catch (e) {
       setProjects(before);
       /* a name that is taken: retrying can't help, so the message says what to do instead */
-      flash(e instanceof ApiError && e.status === 409 ? t('projects.renameTaken').replace('{name}', name.trim()) : t('project.renameFailed'));
+      flash(e instanceof ApiError && e.body.code === 'agent-running' ? t('projects.agentRunningRename')
+        : e instanceof ApiError && e.body.code === 'export-running' ? t('projects.exportRunningRename')
+        : e instanceof ApiError && e.status === 409 ? t('projects.renameTaken').replace('{name}', name.trim()) : t('project.renameFailed'));
     }
   }
 
-  return { projects, folders, loaded, error, flash, reload: reloadFolders, agentRunning, workingIn, deleteProjects, renameProject, createFolder, renameFolder, moveProject, deleteFolder };
+  return { projects, folders, loaded, loadFailed, retryLoad, error, flash, reload: reloadFolders, agentRunning, workingIn, deleteProjects, renameProject, createFolder, renameFolder, moveFolder, moveProject, deleteFolder, coverChanged };
 }
 
 /** The launcher's two views: the person's projects, and the examples to start from (ExamplesGallery). */
 export type LauncherView = 'projects' | 'examples';
 
 /** The switch between them, in the title row (the Community's is the same). */
+/** How long the projects window waits for the tab it opened to cover it before it closes anyway. */
+const COVER_WAIT_MS = 4000;
+
 export function LauncherSwitch({ view, onView }: { view: LauncherView; onView: (view: LauncherView) => void }) {
   const t = useT();
   return <TitleSwitch items={[{ id: 'projects' as const, label: t('launcher.projects') }, { id: 'examples' as const, label: t('launcher.examples') }]} value={view} onChange={onView} />;
@@ -176,6 +245,8 @@ export function ProjectsPopover({
   onOpen,
   onCurrentRemoved,
   onClose,
+  examples,
+  onUseCanvas,
 }: {
   open: boolean;
   /** The project open in the editor ("" when none: Studio has no project to show, and this window is all there is). */
@@ -189,12 +260,19 @@ export function ProjectsPopover({
   onCurrentRemoved: () => void;
   /** Missing: the window cannot be closed (there is no project behind it). */
   onClose?: () => void;
+  /** open on the examples (the app's chat asked for them), and on this one's page */
+  examples?: { example?: string };
+  /** over a film: an example's canvas laid down on its own */
+  onUseCanvas?: (example: Example) => void;
 }) {
   const t = useT();
   const lib = useProjectLibrary(open);
-  /* each time it opens: the projects (the examples are a switch away) */
+  const { flash } = lib;
+  const cover = useProjectCover(lib.coverChanged, React.useCallback(() => flash(t('projects.coverFailed')), [flash, t]));
+  /* each time it opens: the projects (the examples are a switch away), or the examples when asked for */
   const [view, setView] = React.useState<LauncherView>('projects');
-  React.useEffect(() => { if (open) setView('projects'); }, [open]);
+  const opensOn: LauncherView = examples ? 'examples' : 'projects';
+  React.useEffect(() => { if (open) setView(opensOn); }, [open, opensOn]);
   const showView = setView;
   const [pendingDelete, setPendingDelete] = React.useState<string[] | null>(null);
   const [pendingFolder, setPendingFolder] = React.useState<ProjectFolder | null>(null);
@@ -215,9 +293,45 @@ export function ProjectsPopover({
   const go = (projectId: string, kind: 'creating' | 'opening') => {
     /* the project already open: nowhere to go, and an "Opening" that would never end */
     if (projectId === currentProjectId) { close(); return; }
+    /* with tabs it opens in its own tab, not this page: this window stays until that tab covers it (closed first, the
+       page behind would show for a moment), then it is done here; a few seconds at most */
+    const tabs = studioHost?.tabs;
+    if (tabs) {
+      setBusy(kind);
+      let stop = () => {};
+      const timer = setTimeout(() => done(), COVER_WAIT_MS);
+      const done = () => { stop(); clearTimeout(timer); setBusy(null); close(); };
+      stop = tabs.onCovered?.(done) ?? (() => {});
+      onOpen(projectId);
+      return;
+    }
     setBusy(kind);
     onOpen(projectId);
   };
+
+  /** The card may have gone since the last refresh: check before opening a tab or entering the editor. */
+  async function openListed(project: LibraryProject) {
+    if (project.missing) { lib.flash(t(project.missingReason === 'film' ? 'projects.missingFilmOpen' : 'projects.missingOpen')); return; }
+    setBusy('opening');
+    try {
+      const { project: current } = await within(api.opened(project.id), LIST_WAIT_MS);
+      if (current.missing) {
+        setBusy(null);
+        lib.retryLoad();
+        lib.flash(t(current.missingReason === 'film' ? 'projects.missingFilmOpen' : 'projects.missingOpen'));
+        return;
+      }
+      go(project.id, 'opening');
+    } catch (e) {
+      setBusy(null);
+      lib.retryLoad();
+      lib.flash(e instanceof ApiError && (e.status === 404 || e.status === 410)
+        ? t(e.body.code === 'missing-film' ? 'projects.missingFilmOpen' : 'projects.missingOpen')
+        : t('projects.openFolderFailed').replace('{error}', e instanceof Error ? e.message : String(e)));
+    }
+  }
+  /* closed: nothing in progress shows when it opens again */
+  React.useEffect(() => { if (!open) setBusy(null); }, [open]);
   /* another project opened: done */
   const latestClose = React.useRef(close);
   latestClose.current = close;
@@ -231,10 +345,11 @@ export function ProjectsPopover({
     if (wasOpen.current) latestClose.current();
   }, [currentProjectId]);
 
-  async function newProject() {
+  /** A new project in `folderId` (null: the top level), named as Studio names it (Untitled, Untitled 2…), opened at once: it is renamed later. */
+  async function newProject(folderId: string | null) {
     setBusy('creating');
     try {
-      const project = await api.newProject(t('project.untitled'));
+      const project = await newProjectIn(folderId, { create: () => api.newProject(t('project.untitled'), readLastSubtitleStyle() ?? undefined), move: folderApi.move });
       go(project.id, 'creating');
     } catch {
       setBusy(null);
@@ -317,7 +432,7 @@ export function ProjectsPopover({
 
   if (!open) return null;
 
-  /* what the delete dialog says: a project whose folder is gone only leaves the list (the server keeps to that too) */
+  /* unavailable projects only leave the list; any remaining files stay on disk */
   const pendingMissing = (pendingDelete ?? []).filter((id) => lib.projects.find((p) => p.id === id)?.missing).length;
   const onlyMissing = pendingDelete != null && pendingMissing === pendingDelete.length;
   const deleteTitle = !pendingDelete ? ''
@@ -336,33 +451,51 @@ export function ProjectsPopover({
         role="dialog"
         aria-label={t('project.projects')}
         aria-modal="true"
-        className="fixed left-1/2 top-1/2 z-[10050] flex -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border border-[var(--border-strong)] bg-[var(--app-content-bg)] shadow-[0_24px_64px_rgba(0,0,0,0.35)]"
-        style={{
-          width: 'min(1080px, calc(100vw - 64px))',
-          height: 'min(760px, calc(100vh - 96px))',
-        }}
+        className={`fixed left-1/2 top-1/2 z-[10050] flex ${LARGE_DIALOG_SIZE} -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border border-[var(--border-strong)] bg-[var(--bg-panel)] shadow-[0_24px_64px_rgba(0,0,0,0.35)]`}
         onDragOver={onDragOver}
         onDrop={onDrop}
       >
         <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+          {cover.picker}
           {view === 'examples' ? (
             <ExamplesGallery
-              mode="start"
+              key={examples?.example ?? ''}
               heading={<LauncherSwitch view={view} onView={showView} />}
+              {...(examples?.example ? { initial: examples.example } : {})}
               onClose={onClose}
               onStart={(example) => setGithub({ url: example.url, start: true, title: example.title })}
+              /* over a film: the example pointed at in its chat, for the agent to follow (as the Community does) */
+              {...(currentProjectId && studioHost?.refer ? { onReference: (example: Example, part: ExamplePart) => {
+                void sourcesApi.exampleFolder(example.id).catch(() => {});
+                studioHost?.refer?.({
+                  kind: 'example', id: example.id, title: example.title, url: example.url, ...(example.description ? { description: example.description } : {}),
+                  ...(part ? { start: part.from, end: part.to, ...(part.segment ? { segment: part.segment } : {}) } : {}),
+                });
+                onClose?.();
+              } } : {})}
+              {...(currentProjectId && onUseCanvas ? { onUseCanvas } : {})}
+              /* over a film: how it was made, asked in its chat */
+              {...(currentProjectId && studioHost?.ask ? { onExplain: (example: Example, canvas: boolean) => {
+                void sourcesApi.exampleFolder(example.id).catch(() => {});
+                studioHost?.ask?.({
+                  text: t(canvas ? 'gallery.explainAskCanvas' : 'gallery.explainAsk'),
+                  refs: [{ kind: 'example', id: example.id, title: example.title, url: example.url, ...(example.description ? { description: example.description } : {}), ...(canvas ? { canvas: true } : {}) }],
+                });
+                onClose?.();
+              } } : {})}
             />
           ) : lib.loaded ? (
+            <ProjectCoverContext.Provider value={cover.actions}>
             <ProjectsView
               heading={<LauncherSwitch view={view} onView={showView} />}
               projects={lib.projects}
               creating={busy !== null}
-              onNewProject={() => void newProject()}
+              onNewProject={(folderId) => void newProject(folderId)}
               onOpenFolder={() => void openFolder()}
               onGetFromGitHub={() => setGithub({})}
               onLocate={(project) => void locate(project)}
-              /* its folder is gone: there is nothing to open, and the editor would only say so */
-              onOpen={(project) => (project.missing ? lib.flash(t('projects.missingOpen')) : go(project.id, 'opening'))}
+              /* presence is checked again before opening the editor */
+              onOpen={(project) => { void openListed(project); }}
               onRename={(projectId, name) => void lib.renameProject(projectId, name)}
               /* an agent working in one: said at once, before asking (the server refuses it too) */
               onDelete={(ids) => void lib.workingIn(ids).then((working) => {
@@ -380,8 +513,21 @@ export function ProjectsPopover({
                 });
               }}
               onMoveToFolder={lib.moveProject}
+              onMoveFolder={lib.moveFolder}
               onClose={onClose}
             />
+            </ProjectCoverContext.Provider>
+          ) : lib.loadFailed ? (
+            <div role="alert" className="flex flex-1 flex-col items-center justify-center gap-3 text-[13px] text-[var(--text-muted)]">
+              {t('projects.loadFailed')}
+              <button
+                type="button"
+                onClick={lib.retryLoad}
+                className="h-8 rounded-lg bg-[var(--bg-field)] px-3 text-[12.5px] font-medium text-[var(--text)] transition hover:bg-[var(--bg-hover)]"
+              >
+                {t('projects.loadRetry')}
+              </button>
+            </div>
           ) : (
             <div className="flex flex-1 items-center justify-center text-[var(--text-muted)]">
               <Loader2 size={18} className="animate-spin" />
@@ -389,14 +535,14 @@ export function ProjectsPopover({
           )}
         </div>
         {busy ? (
-          <div className="absolute inset-0 z-20 flex items-center justify-center bg-[var(--app-content-bg)]/70">
-            <div className="flex items-center gap-2 rounded-lg bg-[var(--surface)] px-4 py-3 text-sm shadow-lg">
+          <div className="absolute inset-0 z-20 flex items-center justify-center bg-[var(--bg-panel)]/70">
+            <div className="flex items-center gap-2 rounded-lg bg-[var(--bg-raised)] px-4 py-3 text-sm shadow-lg">
               <Loader2 size={16} className="animate-spin" />{t(busy === 'creating' ? 'projects.creating' : 'projects.opening')}
             </div>
           </div>
         ) : null}
         {lib.error ? (
-          <div role="alert" className="pointer-events-none absolute bottom-4 left-1/2 z-30 -translate-x-1/2 rounded-full border border-[var(--err)]/40 bg-[var(--surface)] px-4 py-2 text-[12.5px] font-medium text-[var(--err)] shadow-[var(--shadow-lg)]">
+          <div role="alert" className="pointer-events-none absolute bottom-4 left-1/2 z-30 -translate-x-1/2 rounded-full border border-[var(--err)]/40 bg-[var(--bg-raised)] px-4 py-2 text-[12.5px] font-medium text-[var(--err)] shadow-[var(--shadow-lg)]">
             {lib.error}
           </div>
         ) : null}
@@ -414,6 +560,8 @@ export function ProjectsPopover({
           setPendingDelete(null);
           if (!ids) return;
           void lib.deleteProjects(ids).then((deleted) => {
+            /* their tabs close together, this page's own among them */
+            if (deleted.size) void studioHost?.tabs?.gone?.([...deleted]);
             if (deleted.has(currentProjectId)) onCurrentRemoved();
           });
         }}
@@ -462,6 +610,7 @@ export function ProjectsPopover({
           setPendingFolder(null);
           if (!folder) return;
           void lib.deleteFolder(folder).then((deleted) => {
+            if (deleted.size) void studioHost?.tabs?.gone?.([...deleted]);
             if (deleted.has(currentProjectId)) onCurrentRemoved();
           });
         }}

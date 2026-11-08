@@ -25,11 +25,15 @@ export interface ProjectVersion {
   outcome?: 'stopped' | 'failed' | 'balance';
   /** outcome 'balance': which service had no balance left, and its page to top it up */
   balance?: Balance;
+  /** outcome 'failed': why, as the turn kept it (on its footer's Interrupted, on hover) */
+  error?: string;
   /** When it was sent / settled (ISO): hover says "N minutes ago". */
   createdAt?: string;
   settledAt?: string;
   /** what the turn changed in the project's files (lib/file-changes); none when nothing did */
   fileChanges?: FileChange[];
+  /** the app keeps the files as the turn found them: the turn can be undone (its footer's Undo) */
+  undoable?: boolean;
   /** 'background': the agent started it by itself, a background task of its own having come back (no message) */
   origin?: 'background';
 }

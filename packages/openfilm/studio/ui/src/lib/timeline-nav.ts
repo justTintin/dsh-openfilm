@@ -4,7 +4,7 @@
  * the editor (components/ProjectView).
  */
 import { MIN_BLOCK_MS } from './timeline-drag.ts';
-import { planEdges, planMove, type EditMode, type EditModel, type EditPlan } from './timeline-edit.ts';
+import { NO_SWITCHES, TOUCH_MS, mainTrackOf, planMove, type EditModel, type EditPlan, type Switches } from './timeline-edit.ts';
 import { stepFrames } from './timecode.ts';
 import type { TimelineBlock, TimelineTrack } from './timeline-layout';
 
@@ -42,9 +42,8 @@ const lockedRows = (tracks: readonly TimelineTrack[]) => new Set(tracks.filter((
 
 /**
  * What ⌘B splits at the playhead: the selected clips it is inside; with nothing selected, the clip it is inside on the
- * main track (the lowest picture track), as CapCut; else on the targeted track (`targetLane`), else on the topmost
- * track that is seen and has one. Never a clip on a locked track. The clips linked to them are the caller's to add
- * (the Linked switch).
+ * main track (the lowest picture track); else on the targeted track (`targetLane`), else on the topmost
+ * track that is seen and has one. Never a clip on a locked track. The clips linked to them are the caller's to add.
  */
 export function splitTargets(
   tracks: readonly TimelineTrack[],
@@ -73,7 +72,7 @@ export function splitTargets(
 }
 
 /**
- * What [ / ] select (CapCut's 向左全选 / 向右全选): every clip with a part before the playhead (`dir` -1) or after it
+ * What [ / ] select: every clip with a part before the playhead (`dir` -1) or after it
  * (`dir` 1), on every track not locked — what to move when the film before or after a point moves along.
  */
 export function sideTargets(tracks: readonly TimelineTrack[], atMs: number, dir: -1 | 1): TimelineBlock[] {
@@ -87,32 +86,37 @@ export function splitAllTargets(tracks: readonly TimelineTrack[], atMs: number):
 }
 
 /**
- * Clips (by id, the first leading) moved `frames` frames along their tracks, landing on the frame grid. With the
- * magnet (insert) they move into free time only and stop at a neighbor, as nothing is overwritten then; without it
- * (overwrite) they land a frame on and cut what they cover. Null when nothing can move (a locked track, a neighbor
- * right there, the film's start).
+ * Clips (by id, the first leading) moved `frames` frames along their tracks, landing on the frame grid; a clip in the
+ * way stops them against it, uncut. Null when nothing can move (a locked track, the film's start, a clip right there,
+ * the main track with the magnet, which stays closed up).
  */
-export function planNudge(model: EditModel, ids: readonly string[], frames: number, opts: { mode: EditMode; sync: boolean }): EditPlan | null {
-  const main = model.flatMap((t) => t.clips).find((c) => c.id === ids[0]);
-  if (!main || !frames) return null;
-  const deltaMs = stepFrames(main.startMs, frames) - main.startMs;
-  if (!deltaMs) return null;
-  if (opts.mode === 'overwrite') {
-    const plan = planMove(model, { ids, deltaMs, pointerMs: main.startMs + deltaMs, mode: 'overwrite', sync: opts.sync });
-    return plan?.ops.length ? plan : null;
+export function planNudge(model: EditModel, ids: readonly string[], frames: number, sw: Switches = NO_SWITCHES): EditPlan | null {
+  const lead = model.flatMap((t) => t.clips).find((c) => c.id === ids[0]);
+  if (!lead || !frames) return null;
+  const main = mainTrackOf(model);
+  if (sw.magnet && model.find((t) => t.index === main)?.clips.some((c) => ids.includes(c.id))) return null;
+  let deltaMs = stepFrames(lead.startMs, frames) - lead.startMs;
+  /* the room before the nearest clip they would run into, on each of their tracks */
+  const moving = new Set(ids);
+  for (const t of model) {
+    const others = t.clips.filter((c) => !moving.has(c.id));
+    for (const c of t.clips.filter((x) => moving.has(x.id))) {
+      for (const o of others) {
+        if (deltaMs > 0 && o.startMs >= c.endMs - TOUCH_MS) deltaMs = Math.min(deltaMs, o.startMs - c.endMs);
+        if (deltaMs < 0 && o.endMs <= c.startMs + TOUCH_MS) deltaMs = Math.max(deltaMs, o.endMs - c.startMs);
+      }
+    }
   }
-  const plan = planEdges(model, ids.map((id) => ({ id, kind: 'shift' as const })), deltaMs);
-  return plan.ops.length ? plan : null;
+  if (Math.abs(deltaMs) <= TOUCH_MS) return null;
+  const plan = planMove(model, { ids, deltaMs, pointerMs: lead.startMs + deltaMs, mode: 'place', ...sw });
+  return plan?.ops.length ? plan : null;
 }
-
-/** A track's name as Studio keeps it (`.film/settings.json`): the clips it had when it was named find it again. */
-export type SavedTrackName = { name: string; index: number; clips: string[] };
 
 export type ClipsOf = readonly { clips: readonly { id: string }[] }[];
 
 /**
  * Which track each thing kept about a track (a name, a height) is on now: the track holding the most of the clips it
- * had then, else its place (see trackNamesOf).
+ * had then, else its place.
  */
 export function placeSaved<T extends { index: number; clips: readonly string[] }>(saved: readonly T[], tracks: ClipsOf): Map<T, number> {
   const out = new Map<T, number>();
@@ -132,22 +136,4 @@ export function placeSaved<T extends { index: number; clips: readonly string[] }
     if (entry.index < tracks.length && !taken.has(entry.index)) { out.set(entry, entry.index); taken.add(entry.index); }
   }
   return out;
-}
-
-/**
- * The names kept for tracks, by film.html track index now. A track is found by the clips it had when named (tracks
- * move, and open and close above it, so its place changes; film.html gives a track no id of its own), the one holding
- * the most of them; a track named while empty, or whose clips are all gone, by its place, when no other name took it.
- */
-export function trackNamesOf(saved: readonly SavedTrackName[], tracks: ClipsOf): Map<number, string> {
-  return new Map([...placeSaved(saved, tracks)].map(([entry, i]) => [i, entry.name]));
-}
-
-/** The names to keep once track `index` is named `name` (an empty name takes its name away); names found nowhere go. */
-export function namedTrack(saved: readonly SavedTrackName[], tracks: ClipsOf, index: number, name: string): SavedTrackName[] {
-  const placed = placeSaved(saved, tracks);
-  const kept = saved.filter((entry) => placed.has(entry) && placed.get(entry) !== index)
-    .map((entry) => ({ ...entry, index: placed.get(entry)!, clips: (tracks[placed.get(entry)!]?.clips ?? []).map((c) => c.id) }));
-  const clean = name.trim().slice(0, 40);
-  return clean ? [...kept, { name: clean, index, clips: (tracks[index]?.clips ?? []).map((c) => c.id) }] : kept;
 }

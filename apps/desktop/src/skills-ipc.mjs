@@ -7,13 +7,14 @@
  *                           own skills with whether each is let in (`filtered` false: it has them all, as in its own
  *                           terminal). OpenFilm's own skill for terminal agents is never among them (agent-skills isOurs).
  *   desktop:skills:texts    { project, agent, names } → [{ name, text }]   skills named in a message, as the agent reads
- *                           each (its folder and its SKILL.md whole)
+ *                           each (its folder and its SKILL.md whole): any of OpenFilm's but those turned off, an official one
+ *                           installed or not (Try now, a skill to start from)
  *   desktop:skills:preview  { url } | { folder } → { ok, id, skills: [{ name, description, scripts, size, replaces }] }
  *                           | { ok: false, error } | { ok: false, cancelled }   a GitHub or GitLab address fetched beside
  *                           the person's skills, or a folder on this computer (one dropped, or `folder` null: picked
  *                           in the system's dialog, with the page's `words` { title, button }) looked at where it is, to be looked at first
- *   desktop:skills:commit   { id } → { ok, skills: [Skill] } | { ok: false, error }   kept: added to the person's own
- *                           (a folder copied), one of the same name to the trash
+ *   desktop:skills:commit   { id, covers? } → { ok, skills: [Skill] } | { ok: false, error }   kept: added to the person's own
+ *                           (a folder copied), one of the same name to the trash; covers are chosen image data URLs by skill name
  *   desktop:skills:discard  { id }   let go
  *   desktop:skills:reveal   the person's own skills folder in the file manager
  * For Settings → Agents:
@@ -40,18 +41,19 @@ const require = createRequire(import.meta.url);
 const lib = () => import(pathToFileURL(require.resolve('openfilm/skills')).href);
 const cli = () => import(pathToFileURL(require.resolve('openfilm/skills-cli')).href);
 
-/** A skill as the page shows it. */
-const shown = (s) => ({ name: s.name, description: s.description, source: s.source, folder: s.folder, scripts: s.scripts ?? [], ...(s.over ? { over: s.over } : {}), ...(s.shown ? { shown: s.shown } : {}) });
+/** A skill as the page shows it: by the name the agent is given it by (`as`, agentNames), and its uid. */
+const shown = (s) => ({ name: s.as ?? s.name, uid: s.uid, description: s.description, source: s.source, folder: s.folder, scripts: s.scripts ?? [], ...(s.over ? { over: s.over } : {}), ...(s.shown ? { shown: s.shown } : {}) });
 
 /**
  * @param {import('electron').IpcMain} ipcMain
  * @param {{ trusted: (event: any) => boolean, projects: () => Promise<string[]>, dataDir: string, mine: string,
- *   oldMine?: string, reveal: (path: string) => void, pickFolder: (words: unknown) => Promise<string | null>,
- *   refreshSkills: (agent: string) => void, log: (line: string) => void }} opts
- *   `mine`: the person's own skills folder; `oldMine`: where they were kept before, moved from as this starts;
+ *   prefsHome?: string, oldMine?: string, reveal: (path: string) => void, pickFolder: (words: unknown) => Promise<string | null>,
+ *   refreshSkills: (agent?: string) => void, log: (line: string) => void }} opts
+ *   `mine`: the person's own skills folder; `prefsHome`: the Studio home whose prefs.json says which skills are turned
+ *   off; `oldMine`: where they were kept before, moved from as this starts;
  *   `pickFolder`: a folder of skills picked in the system's dialog (null: cancelled)
  */
-export function registerSkillsIpc(ipcMain, { trusted, projects, dataDir, mine, oldMine, reveal, pickFolder, refreshSkills, log }) {
+export function registerSkillsIpc(ipcMain, { trusted, projects, dataDir, mine, prefsHome, oldMine, reveal, pickFolder, refreshSkills, log }) {
   const store = skillStore(dataDir);
   /* read as the app starts, so the composer's first list does not wait on them: the skills' module, and the login
      shell the agents' own skills are found with */
@@ -77,12 +79,15 @@ export function registerSkillsIpc(ipcMain, { trusted, projects, dataDir, mine, o
   const agentOwn = async (agent, cwd) => (agent && agent !== 'byok'
     ? (await ownSkills(agent, { cwd: cwd ?? '', env: await loginShellVariables({ staleOk: true }) })).filter((s) => !s.ours) : []);
 
+  /* OpenFilm's skills for a project as agents are offered them, each by the name it is given by (openfilm/skills offeredSkills) */
+  const offered = async (cwd) => (await lib()).offeredSkills({ project: cwd, mine, ...(prefsHome ? { home: prefsHome } : {}) });
+
   handle('desktop:skills:list', async ({ project: path, agent }) => {
     const cwd = await project(path);
-    const { listSkills } = await lib();
     const allowed = new Set(store.allowed(agent));
     return {
-      openfilm: listSkills({ project: cwd, mine }).map(shown),
+      /* installed and on (Studio's Skills) */
+      openfilm: (await offered(cwd)).usable.map(shown),
       own: { agent, filtered: FILTERED_AGENTS.includes(agent), skills: (await agentOwn(agent, cwd)).map((s) => ({ name: s.name, description: s.description, folder: s.folder, allowed: allowed.has(s.name) })) },
       mine,
     };
@@ -90,9 +95,11 @@ export function registerSkillsIpc(ipcMain, { trusted, projects, dataDir, mine, o
 
   handle('desktop:skills:texts', async ({ project: path, agent, names }) => {
     const cwd = await project(path);
-    const { listSkills, readSkill, skillText } = await lib();
+    const { readSkill, skillText } = await lib();
     const wanted = Array.isArray(names) ? names.filter((n) => typeof n === 'string') : [];
-    const openfilm = new Map(listSkills({ project: cwd, mine }).map((s) => [s.name, s]));
+    /* named in the message: any of OpenFilm's but those turned off, an official one installed or not (Try now), by
+       the name the agent knows it by */
+    const openfilm = new Map((await offered(cwd)).named.map((s) => [s.as, s]));
     const own = new Map((await agentOwn(agent, cwd)).map((s) => [s.name, s]));
     return wanted.flatMap((name) => {
       const skill = openfilm.get(name) ?? (own.has(name) ? readSkill(own.get(name).folder, 'mine') : null);
@@ -127,12 +134,13 @@ export function registerSkillsIpc(ipcMain, { trusted, projects, dataDir, mine, o
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
-  handle('desktop:skills:commit', async ({ id }) => {
+  handle('desktop:skills:commit', async ({ id, covers }) => {
     const what = waiting.get(id);
     waiting.delete(id);
     if (!what) return { ok: false, error: 'Nothing is waiting to be added.' };
     try {
-      const kept = what.folder ? await (await lib()).addSkills(what.folder, { mine }) : await (await cli()).commitSkills(what.staging, { mine });
+      if (covers != null && (typeof covers !== 'object' || Array.isArray(covers))) throw new Error('Invalid skill covers.');
+      const kept = what.folder ? await (await lib()).addSkills(what.folder, { mine, covers }) : await (await cli()).commitSkills(what.staging, { mine, covers });
       return { ok: true, skills: kept.map(shown) };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -150,6 +158,9 @@ export function registerSkillsIpc(ipcMain, { trusted, projects, dataDir, mine, o
     const allowed = new Set(store.allowed(agent));
     return { filtered: FILTERED_AGENTS.includes(agent), skills: (await agentOwn(agent, '')).map((s) => ({ name: s.name, description: s.description, allowed: allowed.has(s.name) })) };
   });
+
+  /* one of OpenFilm's skills turned on or off (Studio's Skills): every agent's sessions take it up */
+  handle('desktop:skills:changed', async () => { refreshSkills(); return { ok: true }; });
 
   handle('desktop:skills:allow', async ({ agent, name, allowed }) => {
     if (typeof agent !== 'string' || typeof name !== 'string' || !name) return { ok: false };

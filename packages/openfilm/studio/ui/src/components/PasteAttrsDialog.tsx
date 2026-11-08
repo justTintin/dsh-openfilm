@@ -5,8 +5,8 @@ import { groupsOf, type AttrGroup, type CopiedAttrs } from '@/lib/clip-attrs';
 import { Card, CardActions, CardButton } from './Card';
 
 /**
- * Paste attributes (⌘⇧V), as CapCut's dialog: what the copied clip has, in two parts — its picture (place and size,
- * blending) and its sound (volume, fades) — each ticked, untick what should stay. Enter pastes, Esc backs out.
+ * Paste attributes (⌘⇧V): what the copied clip has, in two parts — its picture (place and size,
+ * blending, mask) and its sound (volume, fades) — each ticked, untick what should stay. Enter pastes, Esc backs out.
  */
 export function PasteAttrsDialog({
   attrs, onPaste, onCancel,
@@ -31,7 +31,7 @@ export function PasteAttrsDialog({
   if (!attrs || typeof document === 'undefined') return null;
 
   const parts: { title: string; groups: AttrGroup[] }[] = [
-    { title: t('clipAttrs.picture'), groups: offered.filter((g) => g === 'place' || g === 'blend') },
+    { title: t('clipAttrs.picture'), groups: offered.filter((g) => g === 'place' || g === 'blend' || g === 'mask') },
     { title: t('clipAttrs.sound'), groups: offered.filter((g) => g === 'volume' || g === 'fade') },
   ].filter((p) => p.groups.length);
   const flip = (g: AttrGroup) => setPicked((now) => {

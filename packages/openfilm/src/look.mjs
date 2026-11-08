@@ -3,16 +3,30 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, resolve } from 'node:path';
-import { FrameError, launch } from './host.mjs';
-import { blockDiff, checkSound, cutText, fileOf, ffmpeg, filmSound, fmt, hash, homeFor, mix, open, outDir, parseTarget, SAME_LIMIT, shown, shuffled, spread, UsageError } from './shared.mjs';
+import { FrameError, launch, SOFTWARE_GL } from './host.mjs';
+import { LOUDNESS_SLACK, TRUE_PEAK } from './loudness.mjs';
+import { hasAlpha } from './seekable.mjs';
+import { blockDiff, checkSound, cutText, fileOf, ffmpeg, filmSound, fmt, hash, homeFor, locate, mix, open, outDir, parseTarget, SAME_LIMIT, shown, shuffled, spread, UsageError } from './shared.mjs';
+import { sheetTimes } from './samples.mjs';
+import { watch } from './watch.mjs';
 
 const MEDIA = /\.(mp4|mov|m4v|webm|mkv|avi|png|jpe?g|webp|gif|mp3|wav|m4a|aac|ogg|flac)$/i;
+const CELL_WIDTH = 480;
+/* VP9's and VP8's alpha is a side channel ffmpeg's own decoders drop: libvpx reads it, when this ffmpeg has it */
+const LIBVPX = { vp9: 'libvpx-vp9', vp8: 'libvpx' };
+let decoders;
+const hasDecoder = (name) => {
+  decoders ??= spawnSync('ffmpeg', ['-hide_banner', '-decoders'], { encoding: 'utf8', windowsHide: true }).stdout ?? '';
+  return new RegExp(`^\\s*\\S+\\s+${name}\\s`, 'm').test(decoders);
+};
 
 export async function look(args, opts = {}) {
   const { film: target, at, range } = parseTarget(args);
   if (MEDIA.test(target)) return lookMedia(target, at, range, opts);
+  if (opts.full) return lookRendered(target, at, range, opts);
   let s;
-  try { s = await open(target, { root: opts.root, offline: opts.offline, network: opts.network, transparent: true, launch: opts.launch }); }
+  /* `playable`: footage the browser does not decode (ProRes; HEVC without a chip for it) is looked at through a copy it plays */
+  try { s = await open(target, { root: opts.root, offline: opts.offline, network: opts.network, transparent: true, launch: opts.launch, playable: true }); }
   catch (e) { if (e instanceof FrameError) return { ok: false, lines: [`✗ ${e.message}`], files: [] }; throw e; }
   const { film, browser } = s;
   const m = film.meta;
@@ -34,7 +48,7 @@ export async function look(args, opts = {}) {
     /* a page plays no sound of its own: what it still lists in `audio` is heard nowhere until it is a clip */
     for (const page of await pagesWithAudio()) warnings.push(`${page}: window.film.audio is not played: a sound is a clip in film.html`);
     const gpu = await film.gpu();
-    if (/swiftshader|llvmpipe|software/i.test(gpu)) warnings.push(`WebGL runs in software (${gpu}): slow, and pictures may differ from a GPU`);
+    if (SOFTWARE_GL.test(gpu)) warnings.push(`WebGL runs in software (${gpu}): slow, and pictures may differ from a GPU`);
     if (errors.length) return finish();
 
     try { await draw(); } catch (e) {
@@ -84,7 +98,7 @@ export async function look(args, opts = {}) {
       if (range && range[1] > dur) warnings.push(`${fmt(range[0])}-${fmt(range[1])} runs past the film's end (${fmt(dur)}): the sheet stops there`);
       const [from, to] = range ? [clamp(range[0]), Math.min(range[1], dur)] : [0, dur];
       const count = Math.max(1, Math.round(opts.count ?? 12));
-      const times = Array.from({ length: count }, (_, i) => clamp(from + ((to - from) * i) / count));
+      const times = sheetTimes(from, to, count).map(clamp);
       // Twice, each time in its own shuffled order, the way a person scrubs: a frame that depends on what was
       // drawn before it shows up as two different pictures.
       const cut = new Map();
@@ -111,11 +125,13 @@ export async function look(args, opts = {}) {
       const wave = await waveform(s, from, to);
       const marks = joinPieces(m.sounds).filter((c) => (c.at ?? 0) >= from && (c.at ?? 0) < to).map((c) => ({ t: c.at ?? 0, name: basename(c.src) }));
       const file = join(dir, `${Number(from.toFixed(3))}-${fmt(to)}.png`);
-      writeFileSync(file, await sheet(browser, shots, m, from, to, wave, marks));
+      writeFileSync(file, await sheet(browser, shots.map((x) => ({ ...x, png: cellPicture(x.png, dir) })), m, from, to, wave, marks));
       files.push(file);
     }
     sounds.push(...listSounds(s, m, at != null ? [at, at] : range ?? [0, end], warnings));
     if (s.loudness) sounds.push(s.loudness);
+    /* --loudness: how far the mix is from the target a render or an export would bring it to */
+    if (opts.loudness != null && s.mixLoudness) sounds.push(`♪ target  ${towards(s.mixLoudness, opts.loudness)}`);
   }
 
   /* every web page drawn in this frame, checked for text a viewer cannot read whole */
@@ -244,6 +260,17 @@ function listSounds(s, m, [a, b], warnings) {
   return lines;
 }
 
+/**
+ * How far a mix's loudness is from `target` LUFS and the true-peak ceiling, and what brings it there.
+ * @param {{ lufs: number, peak: number }} mix @param {number} target
+ */
+function towards(mix, target) {
+  const off = mix.lufs - target;
+  const level = Math.abs(off) <= LOUDNESS_SLACK ? `on ${target} LUFS` : `${Math.abs(off).toFixed(1)} LU ${off > 0 ? 'above' : 'below'} ${target} LUFS`;
+  const peak = mix.peak > TRUE_PEAK ? `, true peak ${(mix.peak - TRUE_PEAK).toFixed(1)} dB over ${TRUE_PEAK} dBTP` : '';
+  return `${level}${peak}${level.startsWith('on') && !peak ? '' : `: render --loudness=${target} (or the export's loudness) brings it there`}`;
+}
+
 /** The mix of [from, to) as a PNG waveform, or null when the film has no sound. */
 async function waveform(s, from, to) {
   const clips = await filmSound(s, from);
@@ -259,6 +286,7 @@ async function waveform(s, from, to) {
     const lufs = /I:\s*(-?[\d.]+) LUFS/.exec(meter.slice(meter.lastIndexOf('Summary')))?.[1];
     const peak = /Peak:\s*(-?[\d.]+|-inf) dBFS/.exec(meter.slice(meter.lastIndexOf('Summary')))?.[1];
     if (lufs) s.loudness = `♪ mix     ${lufs} LUFS integrated${peak ? ` · true peak ${peak} dBTP` : ''}`;
+    if (lufs) s.mixLoudness = { lufs: Number(lufs), peak: peak && peak !== '-inf' ? Number(peak) : -Infinity };
     return readFileSync(png);
   } finally {
     rmSync(wav, { force: true });
@@ -266,9 +294,26 @@ async function waveform(s, from, to) {
   }
 }
 
+/**
+ * A frame as small as its cell on the sheet (CELL_WIDTH wide, alpha kept): the sheet is one HTML string given to the
+ * browser, and the full frames of a 4K stage (5 to 11 MB each as PNG) pass the 100 MB a page can be given. Through files,
+ * not a pipe, and given up on after 30 s: the frame as it is when ffmpeg cannot.
+ * @param {Buffer} png @param {string} dir
+ */
+function cellPicture(png, dir) {
+  const stem = join(dir, `.cell-${process.pid}-${hash(png)}`);
+  try {
+    writeFileSync(`${stem}-in.png`, png);
+    const r = spawnSync('ffmpeg', ['-v', 'error', '-y', '-i', `${stem}-in.png`, '-vf', `scale=${CELL_WIDTH}:-1,format=rgb24|rgba`, '-frames:v', '1', `${stem}.png`],
+      { timeout: 30_000, windowsHide: true });
+    return r.status === 0 ? readFileSync(`${stem}.png`) : png;
+  } catch { return png; }
+  finally { rmSync(`${stem}-in.png`, { force: true }); rmSync(`${stem}.png`, { force: true }); }
+}
+
 async function sheet(browser, shots, meta, from, to, wave, marks, label = 'sound mix') {
   const cols = shots.length <= 4 ? shots.length : shots.length <= 9 ? 3 : 4;
-  const cellW = 480;
+  const cellW = CELL_WIDTH;
   const cellH = Math.round((cellW * meta.height) / meta.width);
   /* a sound on its own has no frames: the sheet keeps the width of four, the waveform fills it */
   const W = (cols || 4) * (cellW + 6) - 6;
@@ -304,14 +349,52 @@ async function sheet(browser, shots, meta, from, to, wave, marks, label = 'sound
 }
 
 /**
+ * `look --full` of a project: its rendered film (what `render` wrote beside film.html, the newest when there are
+ * several), looked at as a video file with every frame watched (lookMedia).
+ */
+async function lookRendered(target, at, range, opts) {
+  const { dir, name, isFilm } = locate(target, opts.root);
+  const made = ['.mp4', '.mov', '.webm'].map((ext) => join(dir, `${name}${ext}`)).filter((f) => existsSync(f))
+    .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+  if (!made.length) throw new UsageError(`${name} has not been rendered yet: look --full watches every frame of the rendered film, so render it first (openfilm render), or give look a video file with --full`);
+  const result = await lookMedia(made[0], at, range, opts);
+  const source = join(dir, isFilm ? 'film.html' : 'index.html');
+  /* the rendered film is the film as it was then */
+  if (existsSync(source) && statSync(source).mtimeMs > statSync(made[0]).mtimeMs) {
+    result.lines.splice(1, 0, `! ${basename(source)} changed after ${basename(made[0])} was rendered: this is the film as it was then; render again to watch it as it is`);
+  }
+  return result;
+}
+
+/** How a finding is named in look's lines. */
+const FAULT = { flash: 'white flash', jump: 'jumping frame', still: 'still picture', dark: 'black' };
+
+/**
+ * Every frame of a video watched (watch.mjs), in [from, to), as look's lines: one per finding, or one saying there is
+ * none. A still picture may be meant (an end card, a held frame): it is said, the person judges it. `decode`, `alpha`:
+ * a transparent video, read by `decode` and watched over gray, is not judged for black.
+ * @param {string} file @param {number} fps @param {number} from @param {number} to
+ * @param {{ decode?: string[], alpha?: boolean }} [how]
+ */
+export async function watchLines(file, fps, from, to, { decode = [], alpha = false } = {}) {
+  if (!process.stderr.isTTY) process.stderr.write(`  watching every frame (${fmt(from)}–${fmt(to)})…\n`);
+  const found = await watch(file, { fps, from, length: to - from, decode, alpha });
+  if (!found.length) return [`✓ every frame watched at ${Number(fps.toFixed(3))} fps: no white flash, jumping frame, still picture${alpha ? ' (transparent: black not judged)' : ' or black'}`];
+  const lines = found.slice(0, 40).map((f) => `! ${FAULT[f.kind]} at ${f.to - f.from > 0.15 ? `${fmt(f.from)}–${fmt(f.to)}` : fmt(f.from)}: ${f.detail}${f.kind === 'still' ? ' (fine if meant: an end card, a held frame)' : ''}`);
+  if (found.length > 40) lines.push(`! … and ${found.length - 40} more`);
+  return lines;
+}
+
+/**
  * A media file on its own, to choose what to use from it: frames across the file (or a range, or one second at
  * full size) and its own sound, from ffmpeg. Output goes to the project's .film/cache/look (see homeFor).
+ * `full`: a video's every frame is watched too (watchLines), as a rendered film is checked.
  */
 async function lookMedia(target, at, range, opts) {
   const file = resolve(target);
   if (!existsSync(file) || !statSync(file).isFile()) throw new UsageError(`${target}: no such file`);
   const dir = outDir(homeFor(dirname(file)), 'look');
-  const probe = spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type,width,height,avg_frame_rate,r_frame_rate', '-of', 'json', file], { encoding: 'utf8', windowsHide: true });
+  const probe = spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type,codec_name,pix_fmt,width,height,avg_frame_rate,r_frame_rate:stream_tags=alpha_mode', '-of', 'json', file], { encoding: 'utf8', windowsHide: true });
   let info;
   try { info = JSON.parse(probe.stdout); } catch { return { ok: false, lines: [`✗ ${target}: ffprobe cannot read it`], files: [] }; }
   const video = (info.streams ?? []).find((x) => x.codec_type === 'video');
@@ -324,21 +407,30 @@ async function lookMedia(target, at, range, opts) {
   const fps = video ? rate(video.avg_frame_rate) ?? rate(video.r_frame_rate) : null;
   const name = basename(file, extname(file));
   const head = `${basename(file)}  ${video ? `${w}×${h}` : 'sound only'}${dur ? ` · ${fmt(dur)}` : ''}${fps && !still ? ` · ${Number(fps.toFixed(3))} fps` : ''}${audio ? ' · with sound' : ''}`;
-  const grab = (t) => {
+  const libvpx = video?.tags?.alpha_mode === '1' && LIBVPX[video.codec_name];
+  const decode = libvpx && hasDecoder(libvpx) ? ['-c:v', libvpx] : [];
+  const grab = (t, thumbnail = false) => {
     const out = join(dir, `.${name}-${fmt(t)}.png`);
-    const r = spawnSync('ffmpeg', ['-v', 'error', '-y', ...(still ? [] : ['-ss', String(t)]), '-i', file, '-frames:v', '1', out], { windowsHide: true });
+    // Resize before base64 embedding: full-size high-bit-depth PNGs can exceed Node's string limit together. 8 bits, alpha kept.
+    const r = spawnSync('ffmpeg', ['-v', 'error', '-y', ...(still ? [] : ['-ss', String(t)]), ...decode, '-i', file,
+      ...(thumbnail ? ['-vf', `scale=${CELL_WIDTH}:-1,format=rgb24|rgba`] : []), '-frames:v', '1', out], { windowsHide: true });
     if (r.status !== 0) throw new Error(`ffmpeg could not take a frame at ${fmt(t)}`);
     const png = readFileSync(out); rmSync(out, { force: true }); return png;
   };
   const files = [];
+  const watched = [];
+  if (opts.full && (!video || still)) watched.push(`! --full watches a video's frames; ${basename(file)} has none to watch`);
   if (video && (at != null || still)) {
+    if (opts.full && !still) watched.push('! --full watches a stretch of frames, not one: give a range (a-b) or none');
     const t = still ? 0 : Math.min(Math.max(0, at), Math.max(0, dur - 0.04));
     const out = join(dir, still ? `${name}.png` : `${name}-${fmt(t)}.png`);
     writeFileSync(out, grab(t)); files.push(out);
   } else {
     const [from, to] = range ? [Math.max(0, range[0]), Math.min(range[1], dur)] : [0, dur];
     const count = Math.max(1, Math.round(opts.count ?? 12));
-    const times = video ? Array.from({ length: count }, (_, i) => from + ((to - from) * i) / count) : [];
+    /* ffmpeg has no frame at the file's own end: the last one a sheet can draw is two frames before it */
+    const last = Math.max(from, dur - (fps ? 2 / fps : 0.04));
+    const times = video ? sheetTimes(from, Math.min(to, last), count) : [];
     let wave = null;
     if (audio) {
       const png = join(dir, `.${name}-wave.png`);
@@ -348,11 +440,12 @@ async function lookMedia(target, at, range, opts) {
     }
     const browser = await launch(opts.launch);
     try {
-      const shots = times.map((t) => ({ t, png: grab(t) }));
+      const shots = times.map((t) => ({ t, png: grab(t, true) }));
       const out = join(dir, `${name}-${Number(from.toFixed(3))}-${fmt(to)}.png`);
       writeFileSync(out, await sheet(browser, shots, { width: w || 1920, height: h || 1080 }, from, to, wave, [], 'its sound'));
       files.push(out);
     } finally { await browser.close(); }
+    if (opts.full && video && !still) watched.push(...await watchLines(file, fps ?? 30, from, to, { decode, alpha: hasAlpha(video) }));
   }
-  return { ok: true, lines: [head, ...files.map((f) => `→ ${shown(f)}`)], files };
+  return { ok: true, lines: [head, ...watched, ...files.map((f) => `→ ${shown(f)}`)], files };
 }

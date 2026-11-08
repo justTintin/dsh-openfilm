@@ -61,7 +61,12 @@ export function parseTarget(args) {
   return { film, at, range };
 }
 
-/** Serve the film's folder, open it in Chromium, wait for window.film and `ready`. */
+/**
+ * Serve the film's folder, open it in Chromium, wait for window.film and `ready`. `playable`: its picture is wanted,
+ * so footage this browser does not decode (ProRes; HEVC without a chip for it) is served as a copy it plays, made
+ * before the film opens (seekable.mjs): the film's video clips (`true`), or these files. `browser`: one to open it in
+ * (a render's, from a BrowserPool), which close() leaves open: only the film's tab is closed.
+ */
 export async function open(target, opts = {}) {
   const loc = locate(target, opts.root);
   /* an edit is read before anything opens: its problems, every one, at once */
@@ -69,14 +74,26 @@ export async function open(target, opts = {}) {
     const { problems } = readFilmFile(readFileSync(join(loc.dir, FILM_FILE), 'utf8'));
     if (problems.length) throw new FrameError(problems.length === 1 ? problems[0] : `${FILM_FILE} has ${problems.length} problems:\n  ${problems.join('\n  ')}`);
   }
-  const site = await serve(loc.root, { swap: opts.swap });
+  /** @type {Map<string, string>} */
+  const copies = new Map();
+  const site = await serve(loc.root, { swap: (file) => opts.swap?.(file) ?? copies.get(file) ?? null, missed: opts.missed });
+  const lent = opts.browser ?? null;
   let browser;
-  try { browser = await launch(opts.launch); }
+  try { browser = lent ?? await launch(opts.launch); }
   catch (e) { await site.close(); throw e; }
+  if (opts.playable) {
+    try {
+      const { browserCopies, filmVideos } = await import('./seekable.mjs');
+      const files = Array.isArray(opts.playable) ? opts.playable : loc.isFilm ? filmVideos(loc.root, loc.entry) : [];
+      for (const [file, copy] of await browserCopies(browser, site.url, loc.root, files, { signal: opts.signal })) copies.set(file, copy);
+    } catch { /* the footage as it is */ }
+  }
+  /** @type {FilmPage} */
   let film;
+  const end = async () => { if (lent) await film?.close().catch(() => {}); else await browser.close(); await site.close(); };
   try { film = await FilmPage.open(browser, site.url, loc.entry, opts); }
-  catch (e) { await browser.close(); await site.close(); throw e; }
-  return { ...loc, site, browser, film, async close() { await browser.close(); await site.close(); } };
+  catch (e) { await end(); throw e; }
+  return { ...loc, site, browser, film, close: end };
 }
 
 /**
@@ -145,7 +162,8 @@ export async function write(stream, buf) {
 }
 
 /**
- * Where a path the film asks for (a sound's `src`, resolved from the entry as the browser would) lives on disk. The
+ * Where an address the film asks for (a sound's `src`, resolved from the entry as the browser would; a clip's src made
+ * one by film-doc's srcHref) lives on disk. The
  * file is inside the film's folder; a link out of it is followed only to media the person linked (`readableLink`,
  * src/media-links.mjs), as the file server does.
  */
@@ -202,14 +220,29 @@ export async function filmSound(s, from) {
 }
 
 const audioStreams = new Map();
+/**
+ * How many channels a file's first sound stream has: 0 without one (a video clip may be silent). Kept by the file's
+ * version, so a file made again at the same path (Studio runs for days) is asked again; a file ffprobe could not read
+ * is not kept as silent.
+ */
+export function audioChannels(file) {
+  let version = '';
+  try { const s = statSync(file); version = `${s.mtimeMs}:${s.size}`; } catch { /* gone: asked as it is */ }
+  const key = `${file}\0${version}`;
+  if (!audioStreams.has(key)) {
+    const r = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=channels', '-of', 'csv=p=0', file], { encoding: 'utf8', windowsHide: true });
+    if (r.error) throw new Error(`ffprobe: ${/** @type {NodeJS.ErrnoException} */ (r.error).code === 'ENOENT' ? 'not found on the PATH (it comes with ffmpeg)' : r.error.message}`);
+    const out = (r.stdout ?? '').trim();
+    const channels = out ? Number.parseInt(out, 10) || 2 : 0;
+    if (r.status !== 0) return channels;
+    audioStreams.set(key, channels);
+  }
+  return audioStreams.get(key);
+}
+
 /** Whether a file has a sound stream (a video clip may be silent). */
 export function hasAudio(file) {
-  if (!audioStreams.has(file)) {
-    const r = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', file], { encoding: 'utf8', windowsHide: true });
-    if (r.error) throw new Error(`ffprobe: ${/** @type {NodeJS.ErrnoException} */ (r.error).code === 'ENOENT' ? 'not found on the PATH (it comes with ffmpeg)' : r.error.message}`);
-    audioStreams.set(file, (r.stdout ?? '').trim().length > 0);
-  }
-  return audioStreams.get(file);
+  return audioChannels(file) > 0;
 }
 
 /** atempo chain for a playback rate (pitch kept); each stage takes 0.5–2. */
@@ -239,7 +272,7 @@ export function fadeFilter(fade) {
 
 /** Mix clips into one track of `duration` seconds. */
 export async function mix(clips, duration, file, codec = ['-c:a', 'aac', '-b:a', '192k']) {
-  const { inputs, filter } = mixGraph(clips, duration);
+  const { inputs, filter } = mixGraph(clips.map((c) => ({ ...c, channels: c.channels ?? audioChannels(c.file) })), duration);
   /* a mix takes seconds; one that has not ended in minutes never will */
   const timeoutMs = (120 + duration * 2) * 1000;
   /* a long graph goes in a file of its own: a command line has a limit (32,767 characters on Windows), and a film of
@@ -291,10 +324,15 @@ export function mixGraph(clips, duration) {
     const fade = fadeFilter(c.fade);
     const trim = `asetpts=PTS-STARTPTS${c.speed && c.speed !== 1 ? `,${tempo(c.speed)}` : ''}${fade ? `,${fade}` : ''}`;
     const delay = Math.round(c.at * 1000);
-    return `${source[i]}${trim},volume=${c.volume},adelay=${delay}:all=1,aresample=48000,aformat=channel_layouts=stereo[a${i}]`;
+    /* a mono sound on both sides at its own level, as a browser plays it (ffmpeg's own upmix puts it 3 dB lower) */
+    const mono = c.channels === 1 ? ',pan=stereo|c0=c0|c1=c0' : '';
+    return `${source[i]}${trim},volume=${c.volume},adelay=${delay}:all=1${mono},aresample=48000,aformat=channel_layouts=stereo[a${i}]`;
   });
-  /* padded to the film's length and no further, and cut there: the mix always ends */
-  const sum = `${clips.map((_, i) => `[a${i}]`).join('')}amix=inputs=${clips.length}:normalize=0:dropout_transition=0,apad=whole_dur=${duration},atrim=0:${duration}[out]`;
+  /* padded to the film's length and no further, and cut there: the mix always ends. The mix is given its timestamps
+     first, from its samples (it starts at 0 and has no gaps): at times amix's frames come without any (ffmpeg 8 on
+     Linux, about one mix in 25 with three inputs), and apad, which pads by them, then padded nothing and a film whose
+     last sound ended before it did got a mix that ended there */
+  const sum = `${clips.map((_, i) => `[a${i}]`).join('')}amix=inputs=${clips.length}:normalize=0:dropout_transition=0,asetpts=N/SR/TB,apad=whole_dur=${duration},atrim=0:${duration}[out]`;
   return { inputs, filter: [...splits, ...chains, sum].join(';') };
 }
 
@@ -304,7 +342,7 @@ let scriptOption = null;
  * The option that reads a filter graph from a file: `-/filter_complex` since ffmpeg 7, `-filter_complex_script` before
  * (the one older builds know; newer ones drop it).
  */
-function filterScriptOption() {
+export function filterScriptOption() {
   scriptOption ??= new Promise((done) => {
     const r = spawnSync('ffmpeg', ['-hide_banner', '-version'], { encoding: 'utf8', windowsHide: true });
     const major = Number(/^ffmpeg version n?(\d+)\./m.exec(String(r.stdout ?? ''))?.[1]);

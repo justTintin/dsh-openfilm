@@ -1,10 +1,11 @@
 /**
- * The frame of the thing in hand on the stage, shared by a whole clip and a layer inside one (Figma's look).
+ * The frame of the thing in hand on the stage, shared by a whole clip and a layer inside one.
  *
  * A 1px blue border and white corner squares with a blue edge (scale); an invisible ring outside the corners turns the
- * pointer into the rotate cursor; invisible strips on the edges stretch one side (a layer's override scale has x and y;
- * a video's or still's box takes any proportions, its CSS fitting the picture in it; a page's is never stretched, so
- * its frame has corners only). A blue size label sits below the frame. While a gesture runs, a value tag follows the
+ * pointer into the rotate cursor; strips on the edges stretch one side, each marked by a short white bar at its middle
+ * (a layer's override scale has x and y; a video's or still's box takes any proportions, its CSS fitting the picture in
+ * it; a line of words is made wider or narrower only, `edges: 'sides'`, and lays itself out again; another page is
+ * never stretched, so its frame has corners only). A blue size label sits below the frame. While a gesture runs, a value tag follows the
  * pointer: the position when moving, the size when scaling, the angle when turning.
  *
  * Geometry is the frame's own center, size and angle, not its bounding box: a turned thing has a turned frame.
@@ -13,8 +14,9 @@
  * `data-layer-handle`), a crop's in crop mode (`data-crop-kind` / `data-crop-handle`) and several clips' together
  * (`data-group-kind` / `data-group-handle`); one pointer press is routed by the set it lands on.
  */
-/** The stage's "this one" blue: the frame, picked layers and linked outlines are drawn in it. */
-export const FRAME_BLUE = '#0d99ff';
+/** The stage's "this one" color, the accent's teal at one shade for both themes (the picture is not themed): the frame,
+ * picked layers and linked outlines are drawn in it. */
+export const FRAME_COLOR = '#0fa596';
 
 export type FrameCorner = 'nw' | 'ne' | 'se' | 'sw';
 export type FrameEdge = 'n' | 'e' | 's' | 'w';
@@ -41,7 +43,7 @@ const CORNER_AT: Record<FrameCorner, { x: 0 | 1; y: 0 | 1 }> = {
 };
 
 /*
- * The rotate cursor: a quarter arc with an arrow at each end (Figma's; browsers have no such cursor). Drawn for the
+ * The rotate cursor: a quarter arc with an arrow at each end (browsers have no such cursor). Drawn for the
  * top-right corner; other corners and turned frames turn it, cached in 15° steps.
  */
 const ROTATE_CURSORS = new Map<number, string>();
@@ -90,7 +92,8 @@ export function StageTransformFrame({
    */
   scope: 'mg' | 'layer' | 'crop' | 'group';
   corners?: 'scale' | 'none';
-  edges?: boolean;
+  /** strips that stretch one side: all four, the left and right ('sides'), or none */
+  edges?: boolean | 'sides';
   rotate?: boolean;
   /** The size label below the frame; null for none. */
   label?: string | null;
@@ -103,7 +106,7 @@ export function StageTransformFrame({
   const h = Math.max(frame.h, 1);
   /*
    * Handles sit on a frame at least HANDLE_BOX_MIN big: on something tiny (an icon, a thin line) corner squares on its
-   * own edges would pile up over it. As in Figma the blue border keeps the true size and the handles go on the ring
+   * own edges would pile up over it. The blue border keeps the true size and the handles go on the ring
    * outside, the whole middle still draggable.
    */
   const hw = Math.max(w, HANDLE_BOX_MIN);
@@ -141,16 +144,16 @@ export function StageTransformFrame({
             width: w,
             height: h,
             /* a border on something a pixel or two big would cover it: outline it from outside instead */
-            ...(w < 3 || h < 3 ? { boxShadow: `0 0 0 1px ${FRAME_BLUE}` } : { border: `1px solid ${FRAME_BLUE}` }),
-            background: moving ? 'rgba(13,153,255,.06)' : 'transparent',
+            ...(w < 3 || h < 3 ? { boxShadow: `0 0 0 1px ${FRAME_COLOR}` } : { border: `1px solid ${FRAME_COLOR}` }),
+            background: moving ? 'rgba(15,165,150,.06)' : 'transparent',
           }}
         />
-        {edges ? EDGES.map((edge) => (
+        {edges ? EDGES.filter((edge) => edges !== 'sides' || edge === 'e' || edge === 'w').map((edge) => (
           <div
             key={edge}
             {...attrs('stretch', edge)}
             aria-hidden
-            className="pointer-events-auto absolute"
+            className="pointer-events-auto absolute flex items-center justify-center"
             style={{
               cursor: resizeCursor(EDGE_ANGLE[edge] + frame.r),
               ...(edge === 'n' ? { left: insetX, right: insetX, top: -4, height: 8 }
@@ -158,7 +161,15 @@ export function StageTransformFrame({
                   : edge === 'w' ? { top: insetY, bottom: insetY, left: -4, width: 8 }
                     : { top: insetY, bottom: insetY, right: -4, width: 8 }),
             }}
-          />
+          >
+            {/* the mark that says this side can be pulled: a short bar along it, where the frame is long enough */}
+            {(edge === 'n' || edge === 's' ? hw : hh) >= 48 ? (
+              <span
+                className="block rounded-full bg-white"
+                style={{ ...(edge === 'n' || edge === 's' ? { width: 14, height: 4 } : { width: 4, height: 14 }), border: `1px solid ${FRAME_COLOR}` }}
+              />
+            ) : null}
+          </div>
         )) : null}
         {rotate ? CORNERS.map((corner) => {
           const at = CORNER_AT[corner];
@@ -198,13 +209,13 @@ export function StageTransformFrame({
             >
               <span
                 className="block h-[8px] w-[8px] bg-white"
-                style={{ border: `1px solid ${FRAME_BLUE}`, boxShadow: '0 0 0 0.5px rgba(0,0,0,.08)' }}
+                style={{ border: `1px solid ${FRAME_COLOR}`, boxShadow: '0 0 0 0.5px rgba(0,0,0,.08)' }}
               />
             </div>
           );
         }) : null}
       </div>
-      {/* shown while dragging too: the frame moves and its size changes, and the label follows (as in Figma) */}
+      {/* shown while dragging too: the frame moves and its size changes, and the label follows */}
       {label ? <FrameLabel frame={{ ...frame, w: hw, h: hh }} text={label} {...(bounds ? { bounds } : {})} /> : null}
     </>
   );
@@ -226,7 +237,7 @@ function FrameLabel({ frame, text, bounds }: { frame: FrameGeometry; text: strin
   return (
     <div
       className="pointer-events-none absolute z-[7] -translate-x-1/2 whitespace-nowrap rounded-[3px] px-1 py-[1px] text-[10px] font-medium leading-[14px] text-white tabular-nums"
-      style={{ left: frame.cx, top, background: FRAME_BLUE }}
+      style={{ left: frame.cx, top, background: FRAME_COLOR }}
     >
       {text}
     </div>

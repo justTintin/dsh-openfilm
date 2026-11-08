@@ -1,13 +1,12 @@
 /**
- * A page clip's template controls: what the inspector offers to change in a page without opening it, as a motion
- * graphics template has. Read from the page as it is on the picture (studio/server/stage.js `controls`): the CSS custom
- * properties its stylesheets set on `:root`, its words, and its pictures. Each change is an override of the clip, as any
- * change made on the picture is: a custom property in the style of the `:root` entry (the host sets it with priority,
- * so it wins over the page's own), words as a `text` entry, a picture as the CSS that draws another file in its place
- * (`content: url()` for an <img>, `background-image` for a box painted with one). Nothing for an agent to learn: a page
- * that keeps its colors and sizes in custom properties is a template already.
+ * What a page shows that a clip can change without opening it, read from the page as it is on the picture
+ * (studio/server/stage.js `controls`): the CSS custom properties its stylesheets set on `:root`, its words, and its
+ * pictures. The clip's properties (lib/component-props) are made of them. Each change is an override of the clip, as
+ * any change made on the picture is: a custom property in the style of the `:root` entry (the host sets it with
+ * priority, so it wins over the page's own), words as a `text` entry, a picture as the CSS that draws another file in
+ * its place (`content: url()` for an <img>, `background-image` for a box painted with one).
  *
- * Pure: no React, no DOM, so `node --test` runs it (src/template-controls.test.mjs).
+ * Pure: no React, no DOM, so `node --test` runs it.
  */
 
 import type { FilmOverride } from './film.ts';
@@ -108,9 +107,9 @@ export function relativeTo(page: string, path: string): string {
 /** A file's place as CSS writes it. */
 export const cssUrl = (path: string) => `url("${path.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}")`;
 
-/** The place a CSS `url()` names, or null. */
+/** The place a CSS `url()` names, or null. A backslash only starts an escape, so a quote left open fails at once. */
 export function urlOf(css: string | null | undefined): string | null {
-  const m = /^\s*url\(\s*(?:"((?:\\.|[^"])*)"|'((?:\\.|[^'])*)'|([^)\s]*))\s*\)\s*$/.exec(css ?? '');
+  const m = /^\s*url\(\s*(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^)\s]*))\s*\)\s*$/.exec(css ?? '');
   if (!m) return null;
   return (m[1] ?? m[2] ?? m[3] ?? '').replace(/\\(.)/g, '$1');
 }
@@ -121,7 +120,31 @@ export function changedImage(overrides: readonly FilmOverride[] | undefined, ima
   return v == null ? null : urlOf(String(v));
 }
 
+/** The style that draws another file in a picture's place (`path` from the page's folder), or its own again (null). */
+export function pictureStyle(kind: TemplateImage['kind'], path: string | null): Record<string, string | null> {
+  return { [imageKey(kind)]: path == null ? null : cssUrl(path) };
+}
+
 /** The next overrides with another file drawn in a picture's place (`path` from the page's folder; null: the page's own). */
 export function withImage(overrides: readonly FilmOverride[] | undefined, image: Pick<TemplateImage, 'at' | 'n' | 'kind'>, path: string | null): FilmOverride[] | null {
   return nextOverrides(overrides, { at: image.at, ...(image.n != null ? { n: image.n } : {}) }, { style: { [imageKey(image.kind)]: path == null ? null : cssUrl(path) } });
+}
+
+/* one step of a selector, `tag.class.class` (a step of the stage's path may add `:nth-of-type(2)`) */
+const stepParts = (step: string) => {
+  const m = /^([a-z][\w-]*)?((?:\.[\w-]+)*)(?::[\w-]+\([^)]*\))*$/i.exec(step.trim());
+  return m ? { tag: m[1]?.toLowerCase() ?? '', classes: (m[2] ?? '').split('.').filter(Boolean) } : null;
+};
+/**
+ * Whether a page's own words, named by the stage by their path (`body > div.w > div.t`), are what a property names by a
+ * selector of tags and classes (`.t`, `.t > .x`): its steps, from the last, each found in the path's last ones.
+ */
+export function pathIsAt(path: string, selector: string): boolean {
+  const want = selector.split('>').map(stepParts);
+  const have = path.split('>').map(stepParts);
+  if (want.some((w) => !w || (!w.tag && !w.classes.length)) || want.length > have.length) return false;
+  return want.every((w, i) => {
+    const h = have[have.length - want.length + i];
+    return Boolean(h) && (!w!.tag || w!.tag === h!.tag) && w!.classes.every((c) => h!.classes.includes(c));
+  });
 }

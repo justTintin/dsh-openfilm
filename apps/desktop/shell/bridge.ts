@@ -10,12 +10,11 @@
  * (src/preload.cjs). Imported before Studio's modules and the chat's: Studio reads its host as it loads.
  */
 import { flushSync } from 'react-dom';
-import type { CommunityItem, HostAgent, HostAsk, HostUpdate, HostUpdateState, StudioCommand, StudioHost, StudioRef, StudioSelection } from 'openfilm/studio-ui/lib/host.ts';
+import type { CommunityItem, HostAgent, HostAsk, HostProject as Project, HostUpdate, HostUpdateState, StudioCommand, StudioHost, StudioRef, StudioSelection } from 'openfilm/studio-ui/lib/host.ts';
 
 type Listener<T> = (value: T) => void;
 type Stop = () => void;
 type Theme = 'light' | 'dark';
-type Project = { id: string; name: string; path: string };
 
 interface Native {
   platform: string;
@@ -28,15 +27,16 @@ interface Native {
   /* the window's tabs (src/tabs.mjs) */
   tabs: NonNullable<StudioHost['tabs']>;
   localAgents: Record<string, unknown>;
-  importFile(request: { projectId: string; path: string; name: string }): Promise<{ ok: true; path: string } | { ok: false; error: string }>;
   chat: Record<string, (...args: never[]) => Promise<unknown>>;
   /* the composer's Skills button (src/skills-ipc.mjs) */
   skills: Record<string, (...args: never[]) => Promise<unknown>>;
   prefs: { get(): Promise<AppPrefs>; set(next: Partial<AppPrefs>): Promise<unknown>; onChange(listener: Listener<AppPrefs>): Stop };
   saveLayout(layout: { chatOpen: boolean; chatWidth: number }): void;
   setTheme(theme: Theme): void;
+  setLanguage(language: string): void;
   onFullScreen(listener: Listener<boolean>): Stop;
   onToggleChat(listener: Listener<void>): Stop;
+  onOpenSettings(listener: Listener<void>): Stop;
   onStudioBrowser(listener: Listener<unknown>): Stop;
   onFfmpeg(listener: Listener<unknown>): Stop;
   onUpdate(listener: Listener<unknown>): Stop;
@@ -59,7 +59,7 @@ function signal<T>(value: T) {
 }
 const events = <T,>() => signal<T>(undefined as T);
 
-/* ── the chat's column: open or not, how wide, and the assets drawer over it ── */
+/* ── the chat's column, left of Studio: open or not, how wide, and the assets drawer over it ── */
 const TOP_BAR = 32;
 const column = document.getElementById('of-chat')!;
 const layout = { open: true, width: 420, min: 340, studioMin: 640 };
@@ -127,18 +127,33 @@ new MutationObserver(() => {
 /* the window behind the page, and the system's menus and dialogs, take the same theme */
 native.setTheme(theme.get());
 theme.on((next) => native.setTheme(next));
+/* and the app keeps the language, for the window it shows before the page (an update installed at launch) */
+native.setLanguage(language.get());
+language.on((next) => native.setLanguage(next));
 
 /* ── the project Studio shows (its address, /projects/<id>) ── */
 const project = signal<Project | null>(null);
 let projectReady: Promise<void> = Promise.resolve();
+let projectRequest = 0;
+const projectId = () => /^\/projects\/([\w-]+)/.exec(location.pathname)?.[1] ?? null;
+function projectChanged(next: Project, request?: number) {
+  if (next.id !== projectId()) return;
+  if (request === undefined) projectRequest += 1;
+  else if (request !== projectRequest) return;
+  const current = project.get();
+  if (current?.id === next.id && current.name === next.name && current.path === next.path) return;
+  project.set({ id: next.id, name: next.name, path: next.path });
+}
 async function follow() {
-  const id = /^\/projects\/([\w-]+)/.exec(location.pathname)?.[1] ?? null;
-  if (!id || id === project.get()?.id) return;
+  /* Reads from before a rename or a previous visit cannot restore an old folder. */
+  const request = ++projectRequest;
+  const id = projectId();
+  if (!id) return; // Keep the chat mounted while the project list covers it.
   try {
     const res = await fetch('/api/projects');
     const body = await res.json() as { projects?: Project[] };
     const found = body.projects?.find((p) => p.id === id);
-    if (found) project.set({ id: found.id, name: found.name, path: found.path });
+    if (found) projectChanged(found, request);
   } catch { /* told next time the address changes */ }
 }
 for (const method of ['pushState', 'replaceState'] as const) {
@@ -151,9 +166,10 @@ projectReady = follow();
 /* ── between Studio and the chat: what is selected, what is referenced, what Studio is asked to show ── */
 const selection = signal<StudioSelection | null>(null);
 const refer = events<StudioRef>();
-/* a skill picked in the examples (Studio's ExamplesDialog), to be named in the message; and "Add a skill" there */
-const skillPicked = events<{ name: string; description: string }>();
+/* a skill tried in Studio's library, to be named in the message; and "Add a skill" */
+const skillPicked = events<{ name: string; description: string; title?: string; newConversation?: boolean }>();
 const skillAdd = events<void>();
+const asked = events<{ text: string; refs: StudioRef[] }>();
 /** what the pointer is over in Studio (null: nothing), for the chat to light its pills that point at it */
 const hover = signal<StudioRef | null>(null);
 let command: ((command: StudioCommand) => void) | null = null;
@@ -254,6 +270,7 @@ const INSET_RIGHT = 138;
 const host: StudioHost = {
   version: 1,
   name: 'OpenFilm',
+  projectChanged,
   ...(mac ? { titlebar: { inset: INSET, onChange: (listener: Listener<number>) => { fullScreen.on((full) => listener(full ? 6 : INSET)); } } } : {}),
   ...(windows ? { titlebar: { inset: 6, insetRight: INSET_RIGHT } } : {}),
   /* in order, each with its picture: two pointed at quickly must not swap or share a screenshot */
@@ -264,6 +281,7 @@ const host: StudioHost = {
   onSelection: (next) => selection.set(next),
   onHover: (ref) => hover.set(ref ?? null),
   onCommand: (listener) => { command = listener; },
+  settings: { onOpen: (listener) => native.onOpenSettings(listener) },
   /* read live: Studio may read the panel before or after the kept layout arrives */
   panel: {
     label: 'Chat',
@@ -283,6 +301,7 @@ const host: StudioHost = {
   tabs: native.tabs,
   useSkill: (skill) => skillPicked.set(skill),
   skills: { add: () => skillAdd.set(undefined) },
+  ask: (request) => { if (!layout.open) setChatOpen(true); asked.set(request); },
 };
 (window as unknown as { openfilmHost: StudioHost }).openfilmHost = host;
 
@@ -313,12 +332,14 @@ function commandFor(ref: StudioRef): StudioCommand {
     case 'range': return { type: 'show-range', start: ref.start, end: ref.end };
     case 'track': return { type: 'show-track', track: ref.track };
     case 'file': return { type: 'show-file', path: ref.path };
+    case 'node': return { type: 'show-node', id: ref.id };
     case 'subtitle': return { type: 'show-subtitle', start: ref.start, end: ref.end };
     /* another film: the examples, where it came from */
     case 'example': return { type: 'show-examples', open: { kind: 'example', id: ref.id } };
+    /* a voice: Services, where its service is connected */
+    case 'voice': return { type: 'settings', section: 'providers' };
   }
 }
-const uploadName = (name: string) => name.split(/[\\/]/).pop()!.replace(/[\u0000-\u001f]+/g, '').slice(0, 200) || 'file';
 
 (window as unknown as { openfilmDesktop: unknown }).openfilmDesktop = {
   bridgeVersion: '1',
@@ -361,8 +382,9 @@ const uploadName = (name: string) => name.split(/[\\/]/).pop()!.replace(/[\u0000
   /* the composer's examples button: the examples over the film, to point at one or name a skill */
   showExamples: (open?: CommunityItem) => command?.({ type: 'show-examples', ...(open ? { open } : {}) }),
   onUseSkill: skillPicked.on,
+  onAsk: asked.on,
   onAddSkill: skillAdd.on,
-  useSkill: (skill: { name: string; description: string }) => skillPicked.set(skill),
+  useSkill: (skill: { name: string; description: string; title?: string; newConversation?: boolean }) => skillPicked.set(skill),
   /* a reference made in the chat (⌘L there, the @ menu) gets its picture as Studio's own do */
   withPicture: (ref: StudioRef) => { const done = pictured.then(() => withPicture(ref)); pictured = done.then(() => {}); return done; },
   /* what a pill hovered in the chat points at, lit in Studio while it is (null: none); and the references of the
@@ -376,18 +398,21 @@ const uploadName = (name: string) => name.split(/[\\/]/).pop()!.replace(/[\u0000
     if (!id) return { files: [] };
     try { return await (await fetch(`/api/projects/${encodeURIComponent(id)}/files`)).json(); } catch { return { files: [] }; }
   },
-  /* a file brought into the chat goes into the project (assets/upload/), through Studio's own import: a file on the
-     disk by its path (the app reads it), one with no path (pasted) by its bytes */
-  async importFile(file: { path: string; name: string } | { bytes: ArrayBuffer; name: string }) {
+  /* Studio's skills (its own listing, with their covers), Discover's among them, for the cards of an empty conversation:
+     Discover read first unless it was in the last ten minutes (Studio reads it as it starts), a few seconds at most */
+  async starterSkills() {
     const id = project.get()?.id;
-    if (!id) return { ok: false, error: 'No project is open.' };
-    const name = uploadName(file.name);
-    if ('path' in file) return native.importFile({ projectId: id, path: file.path, name });
+    if (!id) return [];
+    type Listed = { name: string; description: string; cover?: string; order?: number; off?: true; shown?: { title: Record<string, string> } };
     try {
-      const res = await fetch(`/api/projects/${encodeURIComponent(id)}/files?path=${encodeURIComponent(`assets/upload/${name}`)}`, { method: 'PUT', body: file.bytes });
-      const answer = await res.json().catch(() => ({})) as { path?: string; error?: string };
-      return res.ok ? { ok: true, path: answer.path } : { ok: false, error: answer.error ?? `Studio answered ${res.status}` };
-    } catch (error) { return { ok: false, error: (error as Error).message }; }
+      await fetch('/api/skills/catalog', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ fresh: 10 * 60 * 1000 }), signal: AbortSignal.timeout(5000) })
+        .catch(() => { /* offline or slow: what Discover read before */ });
+      const body = await (await fetch(`/api/skills?project=${encodeURIComponent(id)}`)).json() as { skills?: Listed[] };
+      return (body.skills ?? [])
+        .filter((s): s is Listed & { cover: string } => Boolean(s.cover) && !s.off)
+        .sort((a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER))
+        .map((s) => ({ name: s.name, description: s.description, cover: s.cover, title: s.shown?.title ?? null }));
+    } catch { return []; }
   },
   setChatWidth: (width: number, done?: boolean) => setChatWidth(width, done === true),
   setChatOpen,

@@ -8,18 +8,27 @@ import type { ExportQuality, ExportVideoCodec } from '@/lib/export-spec';
 /** `burnSubtitles`: the film's subtitles drawn into the picture, as the editor shows them. */
 type Framing = { frame?: FilmFrameId; fill?: FilmFrameFill; burnSubtitles?: boolean };
 
-/** One export, as the server takes it. `range` is [from, to] in seconds. */
-export type ExportRequest = { range?: [number, number]; label?: string } & (
+/** One export, as the server takes it. `range` is [from, to] in seconds; `name` is what its files are called (the
+ * project's name when there is none). */
+/**
+ * How an editing-program export writes its pages. A draft: `auto` (a page with no clear pixel in any frame as H.264, the
+ * others as lossless PNG), `png`, or `prores` (422 HQ and 4444 the same way). An XML: ProRes 4444 or PNG.
+ */
+export type NleAlpha = 'auto' | 'png' | 'prores' | 'prores4444';
+
+export type ExportRequest = { range?: [number, number]; ranges?: [number, number][]; label?: string; name?: string } & (
   | (Framing & { kind: 'video'; codec: ExportVideoCodec; shortEdge?: number; fps: number; quality: ExportQuality; audio: boolean;
-    clip?: string; scale?: number; preset?: string; sidecar?: 'srt' | 'vtt' })
+    clip?: string; scale?: number; preset?: string; sidecar?: 'srt' | 'vtt'; loudness?: number })
   | (Framing & { kind: 'gif'; width: number; fps: number })
   | { kind: 'audio'; format: 'wav' | 'm4a' | 'mp3'; mix: boolean; stems: boolean }
-  | (Framing & { kind: 'stills'; format: 'png' | 'jpg'; shortEdge: number; at?: number[] })
+  | (Framing & { kind: 'stills'; as?: 'files' | 'zip'; format: 'png' | 'jpg'; shortEdge: number; at?: number[] })
   | (Framing & { kind: 'poster'; format: 'png' | 'jpg'; shortEdge: number; at?: number })
   | { kind: 'subtitles'; format: 'srt' | 'vtt' | 'txt' }
   | (Framing & { kind: 'slides'; format: 'pptx' | 'pdf'; shortEdge: number; at?: number[] })
-  /* for an editing program: an xmeml folder; `media: 'link'` points at the sources where they are instead of cloning them */
-  | { kind: 'nle'; format?: 'xml' | 'jianying' | 'capcut'; fps: number; audio: 'clips' | 'stems'; media?: 'copy' | 'link'; subtitles: boolean }
+  /* for an editing program: an XML and media folder; `media: 'link'` points at the sources where they are instead of cloning them */
+  | { kind: 'nle'; format?: 'xml' | 'fcpxml' | 'jianying' | 'capcut'; fps: number; audio: 'clips' | 'stems'; media?: 'copy' | 'link'; subtitles: boolean;
+      /* how the pages, rendered with their alpha, are written */
+      alpha?: NleAlpha }
   /* the project itself: its work, and the parts of its .film asked; a zip of its folder, or the folder */
   | { kind: 'project'; parts: ProjectPart[]; as: 'zip' | 'folder' }
 );
@@ -56,6 +65,10 @@ export interface ExportJob {
   bytes: number | null;
   /** Whether a transparent export lets anything through (sampled frames); null when not measured. */
   alpha: { any: boolean } | null;
+  /** A draft's app's drafts folder that refused the write: the draft is in the exports folder instead. */
+  draftsRefused?: string;
+  /** The export stopped because the disk is full. */
+  diskFull?: boolean;
   error?: string;
   /** Cancel was asked and the export is stopping (still `running` until it has). */
   cancelling?: boolean;
@@ -71,6 +84,8 @@ export interface ExportCapabilities {
   hevcAlpha: boolean;
   vp9: boolean;
   prores: boolean;
+  /** ProRes encoded by the Mac's media engine, not by ffmpeg's prores_ks */
+  proresChip: boolean;
   mp3: boolean;
 }
 
@@ -90,7 +105,7 @@ async function call<T>(url: string, init?: RequestInit & { json?: unknown }): Pr
  * The project's exports, where they go by default, what this machine encodes, how many subtitle cues the film has, and
  * how big the project and its parts are.
  */
-export function listExports(projectId: string): Promise<{ exports: ExportJob[]; folder: string; can: ExportCapabilities; drafts?: { jianying: boolean; capcut: boolean }; subtitles?: number; project?: ProjectSizes }> {
+export function listExports(projectId: string): Promise<{ exports: ExportJob[]; folder: string; can: ExportCapabilities; drafts?: { jianying: boolean; capcut: boolean }; subtitles?: number; captionTracks?: boolean; project?: ProjectSizes }> {
   return call(endpoint(projectId), { cache: 'no-store' });
 }
 

@@ -103,7 +103,7 @@ writeFileSync(join(stage, 'package.json'), `${JSON.stringify({
   type: 'module',
   main: 'src/main.mjs',
   dependencies,
-  overrides: lockedOverrides(lockedTree),
+  overrides: lockedOverrides(lockedTree, pkg.dependencies),
 }, null, 2)}\n`);
 run('npm', ['install', '--omit=dev', '--omit=optional', '--no-audit', '--no-fund', '--no-package-lock', '--loglevel=error'], { cwd: stage });
 const offLock = versionsOffLock(lockedTree, join(stage, 'node_modules'));
@@ -146,6 +146,9 @@ await builder.build({
       artifactName: `${NAME.replace(' ', '-')}-Setup-\${arch}.\${ext}`,
     },
     nsis: {
+      /* electron-builder leaves these out of its archive and adds them back apart, skipping node_modules: the
+         library's previews (node_modules/openfilm/library/.../preview.mp4) would never reach the computer */
+      preCompressedFileExtensions: null,
       /* the installer asks where to put the app (the person's own folder by default), so it need not live on C: */
       oneClick: false,
       allowToChangeInstallationDirectory: true,
@@ -188,6 +191,8 @@ await builder.build({
       gatekeeperAssess: false,
       entitlements: join(desktop, 'build/entitlements.mac.plist'),
       entitlementsInherit: join(desktop, 'build/entitlements.mac.plist'),
+      /* what macOS says when Studio's record button first asks for the microphone (the entitlement above lets it) */
+      extendInfo: { NSMicrophoneUsageDescription: 'OpenFilm records sound from the microphone when you press Record.' },
       ...(unsigned ? { identity: null } : { identity: IDENTITY, notarize: true }),
     },
     /* the downloads keep one name from version to version: the website links the latest release's by it */

@@ -5,7 +5,7 @@
  * its source's own length and picture size (`spans`); media facts (whether a video has sound) come from probing.
  */
 import type { ClipLook } from './clip-look.ts';
-import { fileStem, filmAudioRoleOf, filmClipKind, filmDocLoc, filmSrcIsStill, filmTrackKind, type FilmDoc, type FilmTrack } from './film.ts';
+import { fileStem, filmAudioRoleOf, filmClipKind, filmDocLoc, filmSrcIsLibrary, filmSrcIsStill, filmTrackKind, type FilmDoc, type FilmTrack } from './film.ts';
 import type { TimelineFilm, TimelineBlock } from './timeline-layout.ts';
 
 /** Where the preview says a clip is: seconds on the film, and its source's own length (none for a still) and size. */
@@ -65,6 +65,8 @@ export function filmShape(
   const scenes: TimelineFilm['scenes'][number][] = [];
   const videos: TimelineFilm['videos'][number][] = [];
   const sounds: TimelineFilm['sounds'][number][] = [];
+  /* videos whose file was not probed (yet): whether they carry sound is not known */
+  let unprobed = 0;
 
   doc.tracks.forEach((track: FilmTrack, ti: number) => {
     const ref: NonNullable<Track> = {
@@ -99,7 +101,8 @@ export function filmShape(
       const durMs = ms(span.end - span.at);
       const { from, speed } = trimOf(raw);
       const inMs = from ? ms(from) : undefined;
-      const still = filmSrcIsStill(clip.src);
+      /* a still, or a thing of the library: its left edge changes its length, never skipping into it */
+      const still = filmSrcIsStill(clip.src) || (kind === 'mg' && filmSrcIsLibrary(clip.src));
       const anchor: TimelineBlock['anchor'] = { move: 'at', resize: 'end', trimFrom: from, ...(still ? { still } : {}), parentStartMs: 0 };
       const volume = typeof raw.volume === 'number' ? raw.volume : undefined;
       const silent = volume != null && volume <= 0;
@@ -160,6 +163,7 @@ export function filmShape(
         });
         /* the footage's own sound: the timeline draws it on the video block, not as a block of its own (at volume 0
            too: it is still there, turned down, and the inspector turns it up again) */
+        if (!still && !media.has(clip.src)) unprobed++;
         if (!still && media.get(clip.src)?.audio) {
           sounds.push({ ...shared, kind: 'voice', src: clip.src, ...(inMs ? { inMs } : {}), ...(speed !== 1 ? { speed } : {}) });
         }
@@ -168,5 +172,5 @@ export function filmShape(
   });
 
   /* the timeline also draws tracks with nothing on them (somewhere to drop), named by their kind */
-  return { scenes, videos, sounds, captions: [], doc: { ...doc, tracks: doc.tracks.map((t) => ({ ...t, kind: filmTrackKind(t) })) } };
+  return { scenes, videos, sounds, captions: [], ...(unprobed ? { unprobed } : {}), doc: { ...doc, tracks: doc.tracks.map((t) => ({ ...t, kind: filmTrackKind(t) })) } };
 }

@@ -5,9 +5,9 @@
  * a project, and what Studio saves from a film, each as a folder of its own holding what it needs (a bundle):
  *
  *   <bundle>/saved.json   { version, savedAt, kind: 'clip' | 'group' | 'page', clip | clips | path, durationMs?, w?,
- *                           h?, template? }   a clip as the film has it (its place, its look, the changes made in its
- *                           page; no time, no id), clips saved together (each one's track from the top one they had
- *                           and `at` seconds from the first), or a page of a project with what it loads
+ *                           h? }   a clip as the film has it (its place, its look, the changes made in its page, the
+ *                           properties it offers; no time, no id), clips saved together (each one's track from the top
+ *                           one they had and `at` seconds from the first), or a page of a project with what it loads
  *   <bundle>/files/…      the clip's file and what it loads (closure.mjs), at the places they had in its project, so a
  *                         page's own references still find what they name
  *   <bundle>/poster.jpg   its picture, when one could be drawn
@@ -16,7 +16,8 @@
  * The API names what is in the library from `saved/` (LIBRARY), as a project's media is named from `assets/`, so the
  * media pane shows both the same way. Used in a project, a thing is a copy: a file is imported into its assets/ as one
  * from the computer is (the same bytes there already are that file), a bundle's files go to `saved/<its place>/` there
- * once (taken again, what is there is used). Changing one never changes the other.
+ * once (taken again, what is there is used). Changing one never changes the other. A page clip saved with
+ * properties (its `data-props`, lib/component-props) is a component: every clip taken from it offers them.
  */
 import { existsSync, createReadStream } from 'node:fs';
 import { copyFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
@@ -26,6 +27,7 @@ import { savedRoot } from '../../src/locations.mjs';
 import { STUDIO_STATE, filmClosure, folderView } from './closure.mjs';
 import { readProjectFilm } from './film.mjs';
 import { cleanName, importFile, inside, kindOf } from './files.mjs';
+import { BUILT_IN, builtInRoot, fetchLibrary } from './library.mjs';
 
 export class SavedError extends Error {
   /** @param {string} message @param {number} status */
@@ -35,13 +37,21 @@ export class SavedError extends Error {
   }
 }
 
+/** OpenFilm's line of words, in its library (the studio's lib/library TEXT_COMPONENT). */
+export const TEXT_COMPONENT = 'text/text';
+/** The fonts a person added to a project for its lines of words (project-fonts addTextFont): its own, never the library's. */
+export const TEXT_OWN_FONTS = 'fonts/own.css';
+/**
+ * A filter of the library on a track of its own (the studio's lib/library FILTER_LAYER): its see-through page, taken
+ * into a project under the filter's own name (`saved/openfilm/filters-warm-film/`), the clip's style grading what is
+ * under it.
+ */
+export const FILTER_LAYER = 'filters/layer';
 const VERSION = 2;
 /** What the API calls the library's top folder: its paths are `saved/<place in the library>`. */
 export const LIBRARY = 'saved';
 /** The file that makes a folder of the library a bundle. */
 const BUNDLE = 'saved.json';
-/** A page whose own CSS sets custom properties on :root (or html): the inspector offers them as its template's controls. */
-const ROOT_VARS = /(?::root|\bhtml)\s*(?:,[^{]*)?\{[^}]*--[\w-]+\s*:/i;
 
 /** The library's folder, made when it is not there yet. */
 export async function libraryRoot() {
@@ -114,15 +124,29 @@ const mainOf = (/** @type {any} */ item) => (item.kind === 'clip' ? item.clip.sr
 /** A bundle as the listing shows it. @param {string} rel @param {any} item */
 function bundleEntry(rel, item) {
   const kind = kindOf(mainOf(item));
+  /* a page saved, or a page clip: where its page is in the library, and how its clip had it (its size, the changes
+     made in it), so the media pane's viewer plays it as the film did */
+  const clip = item.kind === 'clip' && kind === 'page' ? item.clip : null;
+  const size = clip?.size?.w > 0 && clip?.size?.h > 0 ? { w: clip.size.w, h: clip.size.h } : null;
+  /* a component: how many properties it offers (its clip's data-props) */
+  const props = (() => {
+    try { const list = JSON.parse(item.kind === 'clip' ? item.clip.attrs?.['data-props'] ?? '[]' : '[]'); return Array.isArray(list) ? list.length : 0; } catch { return 0; }
+  })();
+  const overrides = Array.isArray(clip?.overrides) && clip.overrides.some((/** @type {any} */ o) => o && typeof o === 'object' && 'at' in o) ? clip.overrides : null;
   const num = (/** @type {unknown} */ v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.round(v) : undefined);
   const savedAt = Date.parse(item.savedAt) || 0;
   const saved = {
     kind: item.kind,
     ...(item.kind === 'group' ? { count: item.clips.length } : {}),
-    ...(item.template === true ? { template: true } : {}),
+    ...(props ? { props } : {}),
     ...(num(item.durationMs) ? { durationMs: num(item.durationMs) } : {}),
     ...(num(item.w) ? { w: num(item.w) } : {}),
     ...(num(item.h) ? { h: num(item.h) } : {}),
+    ...(kind === 'page' && item.kind !== 'group' ? { page: `${rel}/files/${mainOf(item)}` } : {}),
+    /* a clip of a sound, a video or a picture: its file, by its `saved/` path, which the pane plays and pictures */
+    ...(item.kind === 'clip' && ['audio', 'video', 'image'].includes(kind) ? { file: libraryPath(`${rel}/files/${mainOf(item)}`) } : {}),
+    ...(size ? { size } : {}),
+    ...(overrides ? { overrides } : {}),
   };
   return { path: libraryPath(rel), kind: kind === 'page' ? 'page' : kind, size: 0, mtime: savedAt, added: savedAt, saved };
 }
@@ -177,16 +201,14 @@ async function keep(root, files, about, name, into, poster) {
   const folder = freeName(parent, cleanName(name) || 'Saved');
   const dir = join(parent, folder);
   await mkdir(join(dir, 'files'), { recursive: true });
-  let template = false;
   for (const rel of files) {
     const to = join(dir, 'files', rel);
     await mkdir(dirname(to), { recursive: true });
     await copyFile(join(root, rel), to);
-    if (!template && /\.(html?|css)$/i.test(rel)) template = ROOT_VARS.test(await readFile(to, 'utf8').catch(() => ''));
   }
   const picture = poster ? await poster().catch(() => null) : null;
   if (picture) await writeFile(join(dir, 'poster.jpg'), picture);
-  await writeFile(join(dir, BUNDLE), `${JSON.stringify({ version: VERSION, ...about, savedAt: new Date().toISOString(), ...(template ? { template: true } : {}) }, null, 2)}\n`);
+  await writeFile(join(dir, BUNDLE), `${JSON.stringify({ version: VERSION, ...about, savedAt: new Date().toISOString() }, null, 2)}\n`);
   return libraryPath(into ? `${into}/${folder}` : folder);
 }
 
@@ -281,36 +303,76 @@ export async function saveFile(root, rel, o = {}) {
   return libraryPath(path);
 }
 
+/** A place made a name a page's address takes as it is, part by part. */
+const placeName = (/** @type {string} */ rel) => rel.split('/').map((part) => part.normalize('NFKC').replace(/[^\p{L}\p{N}._-]+/gu, '-').replace(/^-+|-+$/g, '') || 'saved').join('/');
+
 /**
- * What a project needs to use a thing of the library (`path`, a `saved/` path): a file imported into its assets/ (as
- * one from the computer is), or a bundle's files copied to `saved/<its place>/` there (a file there already is kept as
- * it is) and the clip, a group's clips or the page, with their files' places there.
+ * `files` (places in folder `from`) copied to the same places in folder `to`. A file there already (copied before,
+ * maybe changed since in that project) stays as it is.
+ * @param {string} from @param {string[]} files @param {string} to
+ */
+async function copyIn(from, files, to, fresh = false) {
+  for (const rel of files) {
+    const dest = join(to, rel);
+    const there = (await stat(dest).catch(() => null))?.isFile();
+    /* `fresh`: one there that is not the library's as it is now is written again, but the project's own fonts */
+    if (there && (!fresh || rel === TEXT_OWN_FONTS || (await readFile(dest)).equals(await readFile(join(from, rel))))) continue;
+    await mkdir(dirname(dest), { recursive: true });
+    await copyFile(join(from, rel), dest);
+  }
+}
+
+/**
+ * What a project needs to use a thing of the library (`path`, a `saved/` path, or an `openfilm/` one for a thing of
+ * OpenFilm's own library, library.mjs): a file imported into its assets/ (as one from the computer is), or a bundle's
+ * files copied to `saved/<its place>/` there (a file there already is kept as it is, but OpenFilm's line of words) and
+ * the clip, a group's clips or the page, with their files' places there. OpenFilm's things go to `saved/openfilm/<its place, one name>/`.
  * @param {string} root @param {unknown} path
  * @returns {Promise<{ clip: Record<string, unknown> & { src: string } } | { clips: { track: number, at: number, clip: Record<string, unknown> & { src: string } }[] } | { path: string }>}
  */
 export async function takeSaved(root, path) {
-  const lib = await libraryRoot();
-  const rel = libraryRel(path);
+  const builtIn = typeof path === 'string' && path.startsWith(`${BUILT_IN}/`);
+  const lib = builtIn ? builtInRoot() : await libraryRoot();
+  const rel = builtIn ? /** @type {string} */ (path).slice(BUILT_IN.length + 1) : libraryRel(path);
   if (!rel) throw new SavedError('a thing in Saved, please', 400);
-  const at = inside(lib, rel);
+  /* a filter (a look, no page of its own): the filter layer's page, under the filter's name */
+  const filter = builtIn && rel !== FILTER_LAYER && /^filters\/[\w-]+$/.test(rel) && !existsSync(inside(lib, rel));
+  /* OpenFilm's own: in the package, or a published part fetched now (library.mjs) */
+  const at = filter ? inside(lib, FILTER_LAYER) : (builtIn ? await fetchLibrary(rel) : null) ?? inside(lib, rel);
   const info = await stat(at).catch(() => null);
   if (!info) throw new SavedError('That is not in Saved any more.', 404);
   if (info.isFile()) return { path: (await importFile(root, `assets/${basename(rel)}`, createReadStream(at))).path };
   const item = await readBundle(at);
   if (!item) throw new SavedError('That is a folder: open it and pick what is in it.', 400);
   /* its place in the project: the library's, made a name a page's address takes as it is */
-  const base = `saved/${rel.split('/').map((part) => part.normalize('NFKC').replace(/[^\p{L}\p{N}._-]+/gu, '-').replace(/^-+|-+$/g, '') || 'saved').join('/')}`;
+  /* OpenFilm's things one folder each under saved/openfilm/ (`effects-snow`), so their pages are no deeper than a
+     project's pages are looked for (files.mjs listFiles) */
+  const base = `saved/${placeName(builtIn ? `${BUILT_IN}/${rel.replaceAll('/', '-')}` : rel)}`;
   const from = join(at, 'files');
+  const files = [];
   for (const entry of await readdir(from, { recursive: true, withFileTypes: true }).catch(() => [])) {
-    if (!entry.isFile()) continue;
-    const src = join(entry.parentPath ?? entry.path, entry.name);
-    const to = join(root, base, src.slice(from.length + 1));
-    /* there already (taken before, maybe changed since in this project): it stays as it is */
-    if ((await stat(to).catch(() => null))?.isFile()) continue;
-    await mkdir(dirname(to), { recursive: true });
-    await copyFile(src, to);
+    if (entry.isFile()) files.push(join(entry.parentPath ?? entry.path, entry.name).slice(from.length + 1));
   }
+  /* the library's line of words (its text component) is one page every text of a project shares, changed only through
+     its variables: a project's copy follows the library's (its motions kept within its box, say), never kept as it was */
+  await copyIn(from, files, join(root, base), builtIn && rel === TEXT_COMPONENT);
   if (item.kind === 'page') return { path: `${base}/${item.path}` };
   if (item.kind === 'group') return { clips: item.clips.map((/** @type {any} */ c) => ({ track: c.track, at: c.at, clip: { ...c.clip, src: `${base}/${c.clip.src}` } })) };
   return { clip: { ...item.clip, src: `${base}/${item.clip.src}` } };
+}
+
+/**
+ * A clip of the project at `fromRoot` brought into the project at `root` (layers pasted from there, lib/layer-clipboard):
+ * its file and what it loads copied to `pasted/<name>/` here (`name`: that project's), at the places they had there,
+ * so a page's own references still find what they name; copied before, what is there is used. The clip, with its
+ * file's place here.
+ * @param {string} root @param {string} fromRoot @param {Record<string, unknown> & { src: string }} clip @param {string} name
+ */
+export async function bringClip(root, fromRoot, clip, name) {
+  if (typeof clip?.src !== 'string' || !clip.src) throw new SavedError('a clip with its file, please', 400);
+  const files = await clipFiles(fromRoot, clip);
+  if (!files.includes(clip.src)) throw new SavedError('That clip’s file is not in its project any more.', 404);
+  const base = `pasted/${placeName(cleanName(name) || 'project')}`;
+  await copyIn(fromRoot, files, join(root, base));
+  return { clip: { ...clip, src: `${base}/${clip.src}` } };
 }

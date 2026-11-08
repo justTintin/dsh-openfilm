@@ -7,7 +7,7 @@
 import * as React from 'react';
 import { AudioLines, HardDriveUpload, Replace, Snowflake } from 'lucide-react';
 
-import { api, type Clip, type Film, type Op, type ProjectSettings } from '@/api';
+import { api, projectEvents, type Clip, type Film, type Op, type ProjectSettings } from '@/api';
 import { useT } from '@/i18n';
 import { canReplace, familyOfClip, replaceClip, type ReplaceFamily, type ReplaceFile } from '@/lib/clip-replace';
 import { freezeSourceMs, planFreeze } from '@/lib/freeze-frame';
@@ -16,12 +16,14 @@ import {
   addMarker, changeMarker, markerClip, nextMarker, parseMarkers, placeMarkers, removeMarker, type Marker, type PlacedMarker,
 } from '@/lib/markers';
 import type { ClipEdit } from '@/lib/film-clip-edits';
+import { historyMoved } from '@/lib/project-history';
 import { heardClips, toggleSolo } from '@/lib/solo';
-import { magnetOn, type EditMode, type EditModel } from '@/lib/timeline-edit';
-import type { KeyCommand } from '@/lib/timeline-keys';
+import type { EditModel } from '@/lib/timeline-edit';
+import { readTimelinePrefs, switchesOf } from '@/lib/timeline-prefs';
+import type { ActionId } from '@/lib/keymap';
+import { useKeyHint } from '@/lib/keymap-store';
 import type { TimelineBlock, TimelineTrack } from '@/lib/timeline-layout';
 import type { MediaListing } from '@/lib/workspace-resources';
-import { followOf, readTimelinePrefs } from '@/lib/timeline-prefs';
 import { ownTrackHeight, sizeOf, trackHeightsOf, withTrackHeight, TRACK_SIZES, type TrackSize } from '@/lib/track-heights';
 import type { Player } from '@/editor/player';
 import type { OutsideStep } from '@/editor/use-film';
@@ -68,6 +70,7 @@ export function useEditorTools({
   pickFile?: (family: ReplaceFamily) => Promise<string | null>;
 }) {
   const t = useT();
+  const keyHint = useKeyHint();
   /* what can take a clip's place: the media and the pages */
   const media = React.useMemo<readonly (ReplaceFile & { name: string })[]>(
     () => [...(listing?.files ?? []).filter((f) => f.kind !== 'other'), ...(listing?.pages ?? [])],
@@ -78,8 +81,8 @@ export function useEditorTools({
   const filmRef = React.useRef(film);
   filmRef.current = film;
 
-  /* ── markers: read once per project, written whole on each change (one at a time, in order), each change a step
-     of the history (⌘Z puts the list back as it was) ── */
+  /* ── markers: read once per project and again when a version is restored, written whole on each change (one at a
+     time, in order), each change a step of the history (⌘Z puts the list back as it was) ── */
   const [markers, setMarkers] = React.useState<Marker[]>([]);
   const markersRef = React.useRef(markers);
   markersRef.current = markers;
@@ -87,8 +90,10 @@ export function useEditorTools({
   React.useEffect(() => {
     let live = true;
     setMarkers([]);
-    void api.markers(projectId).then((raw) => { if (live) setMarkers(parseMarkers(raw)); }, () => {});
-    return () => { live = false; };
+    const load = () => { void api.markers(projectId).then((raw) => { if (live) setMarkers(parseMarkers(raw)); }, () => {}); };
+    load();
+    const stop = projectEvents(projectId, (event) => { if (historyMoved(event)) load(); });
+    return () => { live = false; stop(); };
   }, [projectId]);
   const writeMarkers = React.useCallback((next: Marker[]): Promise<string | null> => {
     setMarkers(next);
@@ -114,7 +119,7 @@ export function useEditorTools({
     const atMs = at ?? timeRef.current;
     const clip = on === undefined ? markerClip(tracksRef.current, selectedClipIds, atMs) : on;
     const { list, added } = addMarker(markersRef.current, atMs, clip);
-    /* one there already: M again names it, as Premiere's */
+    /* one there already: M again names it */
     if (list.length === markersRef.current.length) { setNaming(added.id); return; }
     saveMarkers(list);
     if (added.clip && clip) toast.show(t('editorTools.markerAddedOn').replace('{clip}', clip.title));
@@ -139,8 +144,8 @@ export function useEditorTools({
     onNamed,
   }), [seek, saveMarkers, naming, onNamed]);
 
-  /** The editor's keys for markers (lib/timeline-keys): true when it was one. */
-  const onKey = React.useCallback((cmd: KeyCommand): boolean => {
+  /** The editor's keys for markers (lib/keymap): true when it was one. */
+  const onKey = React.useCallback((cmd: ActionId): boolean => {
     if (cmd === 'add-marker') { addMarkerHere(); return true; }
     if (cmd === 'next-marker' || cmd === 'prev-marker') { goMarker(cmd === 'next-marker' ? 1 : -1); return true; }
     return false;
@@ -258,10 +263,9 @@ export function useEditorTools({
     let still: string;
     try { still = await api.freezeFrame(projectId, block.src, srcMs); }
     catch (e) { toast.showError(t('editorTools.freezeFail').replace('{reason}', (e as Error).message)); return; }
-    const prefs = readTimelinePrefs();
-    const model = editModel();
-    const mode: EditMode = magnetOn(model, ti, prefs.magnet) ? 'insert' : 'overwrite';
-    const ops = planFreeze(model, { clip, track: ti, atMs: at, still, mode, ...followOf(prefs) });
+    /* the still goes in between at the playhead: what follows on that track moves on (with linkage, what
+       rides on the main track along) */
+    const ops = planFreeze(editModel(), { clip, track: ti, atMs: at, still, mode: 'insert', ...switchesOf(readTimelinePrefs()) });
     if (!ops) { toast.show(t('timeline.trackLocked')); return; }
     const failed = await edit(ops, `history.stepFroze|${clip.id}`);
     if (failed) toast.showError(failed);
@@ -361,10 +365,10 @@ export function useEditorTools({
         submenu: choices,
       });
       const on = atMs >= one.startMs && atMs < one.endMs;
-      out.push({ id: 'clip-marker', label: t('editorTools.markerAddClip'), icon: <MarkerGlyph size={14} />, shortcut: 'M', disabled: !on, hint: t('editorTools.freezeOutside'), onSelect: () => addMarkerHere(one) });
+      out.push({ id: 'clip-marker', label: t('editorTools.markerAddClip'), icon: <MarkerGlyph size={14} />, shortcut: keyHint('add-marker'), disabled: !on, hint: t('editorTools.freezeOutside'), onSelect: () => addMarkerHere(one) });
     }
     return out;
-  }, [measuring, media, normalize, freeze, replaceEntries, addMarkerHere, timeRef, t]);
+  }, [measuring, media, normalize, freeze, replaceEntries, addMarkerHere, timeRef, t, keyHint]);
 
   /* ── what the timeline draws ── */
   const clipMarkersByTrack = React.useMemo(() => {
@@ -383,8 +387,8 @@ export function useEditorTools({
   const onAddMarker = React.useCallback(() => addMarkerHere(), [addMarkerHere]);
   /* the ruler's own menu: a marker there (on the film), as M puts one at the playhead */
   const rulerMenu = React.useCallback((atMs: number): ContextMenuEntry[] => [
-    { id: 'add-marker', label: t('editorTools.markerAdd'), icon: <MarkerGlyph size={14} />, shortcut: 'M', onSelect: () => addMarkerHere(null, atMs) },
-  ], [addMarkerHere, t]);
+    { id: 'add-marker', label: t('editorTools.markerAdd'), icon: <MarkerGlyph size={14} />, shortcut: keyHint('add-marker'), onSelect: () => addMarkerHere(null, atMs) },
+  ], [addMarkerHere, t, keyHint]);
   const trackOverlay = React.useCallback((track: TimelineTrack, pxPerMs: number) => {
     const here = clipMarkersByTrack.get(track.lane);
     return here ? <ClipMarkers placed={here} pxPerMs={pxPerMs} height={track.height ?? ownTrackHeight(track)} actions={markerActions} /> : null;

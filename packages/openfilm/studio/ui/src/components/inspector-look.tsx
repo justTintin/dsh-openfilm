@@ -13,17 +13,21 @@ import {
   SquareDashed, Star, Strikethrough, Underline,
 } from 'lucide-react';
 
-import type { useT } from '@/i18n';
+import { useLanguage, type useT } from '@/i18n';
 import {
   ADJUST_KEYS, BLEND_MODES, FADE_DEFAULT, INNER_SHADOW_DEFAULT, PLACED_STROKE_DEFAULT, SHADOW_DEFAULT, adjustOf, backdropBlurCss,
   backdropBlurOf, cropCss, cropForRatio, cropOf, cropRatio, filterParts, framingCss, framingOf, innerShadowCss, innerShadowOf,
-  ownedDeclaration, placedStrokeCss, placedStrokeOf, pxOf, radiusCorners, shadowOf, strokeOf, withAdjust, withShadow, type AdjustKey, type Crop, type Fade,
+  ownedDeclaration, placedStrokeCss, placedStrokeOf, pxOf, radiusCorners, shadowOf, strokeOf, textColorCss, textColorOf, withAdjust, withShadow, type AdjustKey, type Crop, type Fade,
   type FadeSide, type InnerShadow, type PlacedStroke, type Shadow, type StrokePosition, type StrokeStyle,
 } from '@/lib/clip-look';
 import {
-  MASK_FIELDS, MASK_SHAPES, fadeIn, maskDefault, maskOf, maskOwned, withFade, withMask, type Mask, type MaskBox, type MaskShape,
+  MASK_FIELDS, MASK_SHAPES, MASK_STROKE_POSITIONS, fadeIn, maskCss, maskDefault, maskOf, maskOwned, maskStrokeOf, withFade,
+  type Mask, type MaskBox, type MaskShape, type MaskStroke, type MaskStrokePosition,
 } from '@/lib/clip-mask';
 import type { MaskSession } from '@/lib/stage-mask';
+import { previewSettled, type Look, type LookEdit, type LookRead, type LookSet } from '@/lib/look';
+import { gradeFilter, gradeOf, withGrade } from '@/lib/grade';
+import { nameOf, useLibraryIndex } from '@/lib/library';
 import { knownAvailable, stylesOf } from '@/lib/font-menu';
 import {
   NAMED_WEIGHTS, isItalic, joinFontFamily, parseStyleValue, snapStyle, splitFontFamily, styleOptions, styleValue, weightKey, weightNumber,
@@ -33,91 +37,12 @@ import { FONT_SIZES, metricOf } from '@/lib/type-metrics';
 import { familyRenders, useInstalledFonts, useProjectFonts } from '@/lib/use-fonts';
 import { declarations } from '../../../../src/film-doc.mjs';
 import {
-  ColorField, EdgeGlyph, FontSizeGlyph, ICON, LetterSpacingGlyph, LineHeightGlyph, MIXED, MetricField, NumField, RadiusGlyph, RotateGlyph, Row, Section, SectionAction, Segmented, SelectField, SliderField, SubLabel, type FieldApply, type Mixed,
+  ColorField, EdgeGlyph, FontSizeGlyph, ICON, LetterSpacingGlyph, LineHeightGlyph, MIXED, MetricField, NumField, RadiusGlyph, RotateGlyph, Row, Section, SectionAction, Segmented, SelectField, SliderField, SubLabel, type FieldApply,
 } from './inspector-fields';
 import { FontFamilyPicker } from './FontFamilyPicker';
 import { Popover } from './Popover';
 
 type T = ReturnType<typeof useT>;
-
-/* ───────────────────────────── the model ───────────────────────────── */
-
-/** One thing's CSS property (kebab-case), as it is now. */
-export type LookRead = (prop: string) => string | undefined;
-/** Properties to write: a value, or null — "none of mine" (the panel decides what that leaves). */
-export type LookSet = Record<string, string | null>;
-/** What a control does to one thing, from that thing's own values. */
-export type LookEdit = (read: LookRead) => LookSet;
-
-export interface Look {
-  /** How many things it is. */
-  n: number;
-  /** What `fn` makes of every thing's values, when they agree; MIXED when they do not. */
-  common<V>(fn: (read: LookRead) => V): V | Mixed;
-  /** Shows an edit on the picture, nothing written. */
-  preview(edit: LookEdit): void;
-  /** Writes an edit, as one change. */
-  commit(edit: LookEdit): void;
-  /** Takes a preview back off the picture. */
-  revert(): void;
-}
-
-/**
- * A Look over `targets`: read each through `readOf`, and hand each one's properties to `write` (the panel stores
- * them). `write` gets only the things an edit changes.
- */
-export function makeLook<Tg>(
-  targets: readonly Tg[],
-  readOf: (t: Tg) => LookRead,
-  write: {
-    commit: (sets: [Tg, LookSet][]) => void;
-    preview?: (sets: [Tg, LookSet][]) => void;
-    revert?: () => void;
-  },
-): Look {
-  const reads = targets.map(readOf);
-  const sets = (edit: LookEdit, kept?: ReadonlyMap<string, string | undefined>[] | null): [Tg, LookSet][] => targets.flatMap((tg, i) => {
-    const read = reads[i]!;
-    const set = edit(read);
-    /* unchanged properties are not written: the agent reads the diff, and a no-op would be an undo step. Unchanged
-       from what was there before a preview: the layer is measured again while previewed, so by now it reads as the
-       preview, and a kept preview would read as no change */
-    const was = (k: string) => (kept?.[i]?.has(k) ? kept[i]!.get(k) : read(k));
-    const changed = Object.entries(set).filter(([k, v]) => (v ?? undefined) !== was(k));
-    return changed.length ? [[tg, Object.fromEntries(changed)] as [Tg, LookSet]] : [];
-  });
-  return {
-    n: targets.length,
-    common(fn) {
-      if (!reads.length) return MIXED;
-      const first = fn(reads[0]!);
-      const key = JSON.stringify(first);
-      return reads.every((r) => JSON.stringify(fn(r)) === key) ? first : MIXED;
-    },
-    /* shown as said, unchanged or not: a layer reads as its kept change while a preview paints over it, so painting
-       back what was there would read as no change */
-    preview(edit) {
-      if (!previewedBefore || previewedBefore.length !== targets.length) previewedBefore = targets.map(() => new Map());
-      const list = targets.flatMap((tg, i) => {
-        const set = edit(reads[i]!);
-        for (const k of Object.keys(set)) if (!previewedBefore![i]!.has(k)) previewedBefore![i]!.set(k, reads[i]!(k));
-        return Object.keys(set).length ? [[tg, set] as [Tg, LookSet]] : [];
-      });
-      write.preview?.(list);
-    },
-    commit(edit) {
-      const list = sets(edit, previewedBefore);
-      previewedBefore = null;
-      if (list.length) write.commit(list);
-    },
-    revert() { previewedBefore = null; write.revert?.(); },
-  };
-}
-
-/** What each previewed property of the things in hand was before its first preview (see makeLook's `sets`). */
-let previewedBefore: Map<string, string | undefined>[] | null = null;
-/** A preview was painted back by hand (as a preview of what was there): nothing previewed stands any more. */
-const previewSettled = () => { previewedBefore = null; };
 
 /** What a property is when nothing sets it: writing "none of mine" over a look the film's CSS gives, this is written. */
 export const NEUTRAL: Record<string, string> = {
@@ -338,7 +263,7 @@ export function MaskGlyph({ shape }: { shape: MaskShape | 'none' }) {
 }
 
 /**
- * A mask, as CapCut's: a shape the picture shows through (or, inverted, is hidden by), placed, sized, turned and
+ * A mask: a shape the picture shows through (or, inverted, is hidden by), placed, sized, turned and
  * feathered in % of the box. Written as `mask-image` layers (lib/clip-mask: what each shape is in CSS, and how it sits
  * with the faded edges, which share the property, and with the crop's clip-path). A mask written by hand is "custom":
  * the raw CSS (Advanced) has it.
@@ -356,7 +281,7 @@ export function MaskSection({
   /** Whose mask, for the stage's handles. */
   target?: MaskSession['target'] | null;
   onEditMask?: (session: MaskSession | null) => void;
-  /** A shape picked on the picture (the selection bar's Mask): put on, with its handles, once. */
+  /** A shape picked on the picture (its clip menu's Mask): put on, with its handles, once. */
   ask?: { shape: MaskShape | 'none'; n: number } | null;
   onAsked?: () => void;
 }) {
@@ -366,7 +291,8 @@ export function MaskSection({
   const [editing, setEditing] = React.useState(false);
   const canEdit = Boolean(onEditMask && target && look.n === 1);
 
-  const write = (next: Mask | null): LookEdit => (read) => withMask(read('mask-image'), read('mask-composite'), next, mbox) ?? {};
+  /* the shape's stroke (a filter) is drawn again with it */
+  const write = (next: Mask | null): LookEdit => (read) => maskCss(read, next, mbox) ?? {};
   const edit = (fn: (m: Mask) => Mask): LookEdit => (read) => {
     const m = maskOf(read('mask-image'), read('mask-composite'), mbox);
     return m ? write(fn(m))(read) : {};
@@ -396,7 +322,7 @@ export function MaskSection({
   React.useEffect(() => {
     if (!onEditMask) return;
     if (!maskKey || !targetKey) { onEditMask(null); return; }
-    const put = (m: Mask): LookEdit => (read) => withMask(read('mask-image'), read('mask-composite'), m, boxRef.current) ?? {};
+    const put = (m: Mask): LookEdit => (read) => maskCss(read, m, boxRef.current) ?? {};
     onEditMask({
       target: JSON.parse(targetKey) as MaskSession['target'],
       mask: JSON.parse(maskKey) as Mask,
@@ -437,7 +363,7 @@ export function MaskSection({
               type="button"
               aria-pressed={editing}
               onClick={() => setEditing((v) => !v)}
-              className={`flex h-5 items-center gap-1 rounded-[4px] px-1.5 text-[10.5px] font-medium transition hover:bg-[var(--bg-hover)] ${editing ? 'bg-[var(--fill-tsp)] text-[var(--accent)]' : 'text-[var(--text-muted)]'}`}
+              className={`flex h-5 items-center gap-1 rounded-[4px] px-1.5 text-[10.5px] font-medium transition hover:bg-[var(--bg-hover)] ${editing ? 'bg-[var(--bg-field)] text-[var(--accent)]' : 'text-[var(--text-muted)]'}`}
             >
               <SquareDashed size={11} />{t('inspector.maskEditOnPicture')}
             </button>
@@ -483,8 +409,8 @@ export function MaskSection({
               aria-pressed={now.invert}
               onClick={() => look.commit(edit((m) => ({ ...m, invert: !m.invert })))}
               className={`flex h-[26px] items-center justify-center gap-1 rounded-[5px] text-[11px] transition ${now.invert
-                ? 'bg-[var(--bg)] text-[var(--text)] shadow-[0_0_0_0.5px_var(--border-strong)]'
-                : 'bg-[var(--fill-tsp)] text-[var(--text-muted)] hover:text-[var(--text)]'}`}
+                ? 'bg-[var(--bg-panel)] text-[var(--text)] shadow-[0_0_0_0.5px_var(--border-strong)]'
+                : 'bg-[var(--bg-field)] text-[var(--text-muted)] hover:text-[var(--text)]'}`}
             >
               {t('inspector.maskInvert')}
             </button>
@@ -504,9 +430,77 @@ export function MaskSection({
               onRevert={() => look.revert()}
             />
           ) : null}
+          <MaskStrokeFields look={look} t={t} box={mbox} />
         </>
       ) : null}
     </Section>
+  );
+}
+
+/* a new stroke, px on the stage */
+const MASK_STROKE_PX = 4;
+
+/**
+ * The mask's stroke (lib/clip-mask maskCss): along the shape's edge, inside, across or outside it, in a color. Its
+ * width is in px on the stage, kept as % of the box's shorter side (as the feather), so it scales with the box.
+ */
+function MaskStrokeFields({ look, t, box }: { look: Look; t: T; box: MaskBox | null }) {
+  const short = box ? Math.min(box.w, box.h) : 100;
+  const stroke = look.common((read) => maskStrokeOf(read('filter')));
+  /* a filter written by hand takes no stroke from here */
+  const readable = look.common((read) => filterParts(read('filter')) != null) !== false;
+  const edit = (part: (now: MaskStroke) => Partial<MaskStroke>): LookEdit => (read) => {
+    const m = maskOf(read('mask-image'), read('mask-composite'), box);
+    if (!m) return {};
+    const now = maskStrokeOf(read('filter')) ?? { width: (MASK_STROKE_PX / short) * 100, color: '#ffffff', position: 'center' as const };
+    return maskCss(read, m, box, { ...now, ...part(now) }) ?? {};
+  };
+  const remove: LookEdit = (read) => {
+    const m = maskOf(read('mask-image'), read('mask-composite'), box);
+    return m ? maskCss(read, m, box, null) ?? {} : {};
+  };
+  const pxOfWidth = (w: number) => round((w / 100) * short, 1);
+  const width = (apply: FieldApply): LookEdit => edit((now) => ({ width: (Math.max(0, apply(pxOfWidth(now.width))) / short) * 100 }));
+  if (stroke === null || (!stroke && !readable)) return null;
+  return (
+    <>
+      <SubLabel aside={stroke ? (
+        <SectionAction label={t('inspector.effectRemove')} onClick={() => look.commit(remove)}><Minus size={12} /></SectionAction>
+      ) : (
+        <SectionAction label={t('inspector.strokeAdd')} onClick={() => look.commit(edit(() => ({})))}><Plus size={12} /></SectionAction>
+      )}>
+        {t('inspector.stroke')}
+      </SubLabel>
+      {stroke && stroke !== MIXED ? (
+        <>
+          <ColorField
+            label={t('inspector.strokeColor')}
+            value={look.common((read) => maskStrokeOf(read('filter'))?.color ?? '')}
+            onPreview={(c) => look.preview(edit(() => ({ color: c })))}
+            onCommit={(c) => look.commit(edit(() => ({ color: c })))}
+          />
+          <Row>
+            <SelectField
+              label={t('inspector.strokePosition')}
+              value={look.common((read) => maskStrokeOf(read('filter'))?.position ?? 'center')}
+              options={MASK_STROKE_POSITIONS.map((p) => ({ value: p, label: t(`inspector.strokePositions.${p}`) }))}
+              onCommit={(v) => look.commit(edit(() => ({ position: v as MaskStrokePosition })))}
+            />
+            <NumField
+              label={t('inspector.strokeWidth')}
+              prefix={<span className="block h-[7px] w-[9px] rounded-[1.5px] border-[1.5px]" style={{ borderColor: 'currentColor' }} />}
+              value={look.common((read) => { const w = maskStrokeOf(read('filter'))?.width; return w == null ? undefined : pxOfWidth(w); })}
+              unit="px"
+              min={0}
+              max={1000}
+              onPreview={(_, apply) => look.preview(width(apply))}
+              onCommit={(_, apply) => look.commit(width(apply))}
+              onRevert={() => look.revert()}
+            />
+          </Row>
+        </>
+      ) : null}
+    </>
   );
 }
 
@@ -518,7 +512,7 @@ const CORNERS = ['top-left', 'top-right', 'bottom-right', 'bottom-left'] as cons
 type Corner = (typeof CORNERS)[number];
 
 /**
- * Corner radius, as Figma's: one number for all four, or (the button beside it) each corner its own. A crop cuts the
+ * Corner radius: one number for all four, or (the button beside it) each corner its own. A crop cuts the
  * box's own corners away, so it carries the same roundness (one for all: a crop's shape rounds its corners alike).
  */
 function RadiusField({ look, t }: { look: Look; t: T }) {
@@ -558,7 +552,7 @@ function RadiusField({ look, t }: { look: Look; t: T }) {
           title={croppedNow ? t('inspector.cornersCropped') : t('inspector.cornersEach')}
           disabled={croppedNow}
           onClick={() => setEach((v) => !v)}
-          className={`flex h-[26px] w-6 items-center justify-center rounded-[5px] transition disabled:opacity-40 ${each ? 'bg-[var(--bg-active)] text-[var(--text)]' : 'text-[var(--text-faint)] hover:bg-[var(--bg-hover)] hover:text-[var(--text)]'}`}
+          className={`flex h-[26px] w-6 items-center justify-center rounded-[5px] transition disabled:opacity-40 ${each ? 'bg-[var(--bg-pressed)] text-[var(--text)]' : 'text-[var(--text-faint)] hover:bg-[var(--bg-hover)] hover:text-[var(--text)]'}`}
         >
           <Scan size={12} />
         </button>
@@ -587,11 +581,11 @@ function CornerGlyph({ corner }: { corner: Corner }) {
 
 /**
  * Opacity, corner radius (`radius`: for what has corners — a box, a picture, a line with its own fill) and blend,
- * as Figma's Appearance.
+ * the Appearance section.
  */
 /**
  * What the things in hand looked like before a menu showed something else on the picture (a hovered font, weight,
- * size or blend mode, as Figma shows one on the canvas before it is picked): the stage measures a layer again after
+ * size or blend mode, shown on the picture before it is picked): the stage measures a layer again after
  * each preview, so by then it reads as the preview. Giving up (`restore`) paints that back; a pick (`commit`) keeps it.
  */
 function usePreviewed(look: Look) {
@@ -615,7 +609,7 @@ function usePreviewed(look: Look) {
   return { before, remember, restore, preview, commit };
 }
 
-export function AppearanceSection({ look, t, children, radius = false }: { look: Look; t: T; children?: React.ReactNode; radius?: boolean }) {
+export function AppearanceSection({ look, t, children, radius = false, aside }: { look: Look; t: T; children?: React.ReactNode; radius?: boolean; aside?: React.ReactNode }) {
   const previewed = usePreviewed(look);
   const opacity = look.common((read) => {
     const v = Number(read('opacity') ?? 1);
@@ -628,7 +622,7 @@ export function AppearanceSection({ look, t, children, radius = false }: { look:
     return { opacity: n >= 100 ? null : String(Math.round(n * 10) / 1000) };
   };
   return (
-    <Section id="appearance" title={t('inspector.appearance')}>
+    <Section id="appearance" title={t('inspector.appearance')} {...(aside ? { aside } : {})}>
       <SliderField
         label={t('inspector.opacity')}
         value={opacity}
@@ -658,7 +652,7 @@ export function AppearanceSection({ look, t, children, radius = false }: { look:
 /* ───────────────────────────── fill ───────────────────────────── */
 
 /**
- * Fill, as Figma's: what paints the thing — a line's color, a box's background, a shape's fill. One the thing may go
+ * Fill: what paints the thing — a line's color, a box's background, a shape's fill. One the thing may go
  * without (a box's background) has "−" to take it off, and "+" brings one back.
  */
 export function FillSection({ look, t, fills, add }: {
@@ -678,22 +672,27 @@ export function FillSection({ look, t, fills, add }: {
         <SectionAction label={t('inspector.fillAdd')} onClick={() => look.commit(() => ({ [add.prop]: add.value }))}><Plus size={12} /></SectionAction>
       ) : null}
     >
-      {fills.map((f) => (
-        <div key={f.prop} className="flex items-center gap-1.5">
-          <div className="min-w-0 flex-1">
-            <ColorField
-              label={f.label}
-              value={look.common((read) => read(f.prop) ?? '')}
-              onPreview={(c) => look.preview(() => ({ [f.prop]: c }))}
-              onCommit={(c) => look.commit(() => ({ [f.prop]: c }))}
-            />
+      {fills.map((f) => {
+        /* words: the color they are drawn in, which a fill of their page's own paints over `color` */
+        const of = (read: LookRead) => (f.prop === 'color' ? textColorOf(read) : read(f.prop));
+        const to = (c: string): LookEdit => (read) => (f.prop === 'color' ? textColorCss(read, c) : { [f.prop]: c });
+        return (
+          <div key={f.prop} className="flex items-center gap-1.5">
+            <div className="min-w-0 flex-1">
+              <ColorField
+                label={f.label}
+                value={look.common((read) => of(read) ?? '')}
+                onPreview={(c) => look.preview(to(c))}
+                onCommit={(c) => look.commit(to(c))}
+              />
+            </div>
+            {f.removable ? (
+              /* see-through, not "none of mine": that would bring back the page's own fill */
+              <SectionAction label={t('inspector.fillRemove')} onClick={() => look.commit(() => ({ [f.prop]: 'transparent' }))}><Minus size={12} /></SectionAction>
+            ) : null}
           </div>
-          {f.removable ? (
-            /* see-through, not "none of mine": that would bring back the page's own fill */
-            <SectionAction label={t('inspector.fillRemove')} onClick={() => look.commit(() => ({ [f.prop]: 'transparent' }))}><Minus size={12} /></SectionAction>
-          ) : null}
-        </div>
-      ))}
+        );
+      })}
     </Section>
   );
 }
@@ -701,7 +700,7 @@ export function FillSection({ look, t, fills, add }: {
 /* ───────────────────────────── stroke ───────────────────────────── */
 
 /**
- * Stroke, as Figma's: color, weight, where it lies against the edge (inside, across, outside) and its line (solid,
+ * Stroke: color, weight, where it lies against the edge (inside, across, outside) and its line (solid,
  * dashed, dotted). Drawn as an `outline` with its offset (lib/clip-look placedStrokeOf): it adds nothing to the box,
  * so the layout does not move as it is added or thickened.
  */
@@ -804,7 +803,7 @@ const ADJUST_RANGE: Record<AdjustKey, { min: number; max: number; unit: string; 
  * grayscale): 0 is as is, a double-click puts one back, the reset all. Filter functions without a control here
  * (sepia, a url) are kept as written, in their place.
  */
-/* the picture's color; its blur is an effect (Figma's layer blur) */
+/* the picture's color; its blur is an effect (a layer blur) */
 const COLOR_KEYS = ADJUST_KEYS.filter((k) => k !== 'blur');
 
 export function AdjustSection({ look, t }: { look: Look; t: T }) {
@@ -861,12 +860,53 @@ export function AdjustSection({ look, t }: { look: Look; t: T }) {
   );
 }
 
+/**
+ * The library's filter the picture wears (lib/grade), when it has one: its name, how strong it is (0 leaves the
+ * picture as it is), and "−" to take it off. Filters are put on from the library; the adjustments go after one.
+ */
+export function FilterSection({ look, t }: { look: Look; t: T }) {
+  const lang = useLanguage();
+  const index = useLibraryIndex();
+  const now = look.common((read) => gradeOf(read('filter')));
+  const item = now && now !== MIXED ? index?.items.find((i) => i.id === now.id && i.grade) : undefined;
+  if (!item?.grade || !now || now === MIXED) return null;
+  const grade = item.grade;
+  const edit = (apply: FieldApply): LookEdit => (read) => {
+    const n = Math.max(0, Math.min(100, Math.round(apply((gradeOf(read('filter'))?.amount ?? 1) * 100))));
+    return { filter: withGrade(read('filter'), gradeFilter(item.id, grade, n / 100)) };
+  };
+  return (
+    <Section
+      id="filter"
+      title={t('inspector.filter')}
+      aside={(
+        <SectionAction label={t('inspector.filterRemove')} onClick={() => look.commit((read) => ({ filter: withGrade(read('filter'), null) }))}>
+          <Minus size={12} />
+        </SectionAction>
+      )}
+    >
+      <p className="truncate text-[11.5px] font-medium text-[var(--text)]">{nameOf(item.name, lang)}</p>
+      <SliderField
+        label={t('inspector.filterAmount')}
+        value={Math.round(now.amount * 100)}
+        min={0}
+        max={100}
+        neutral={0}
+        unit="%"
+        onPreview={(_, apply) => look.preview(edit(apply))}
+        onCommit={(_, apply) => look.commit(edit(apply))}
+        onRevert={() => look.revert()}
+      />
+    </Section>
+  );
+}
+
 /* ───────────────────────────── effects ───────────────────────────── */
 
 type EffectId = 'shadow' | 'inner' | 'blur' | 'backdrop' | 'fade';
 
 /**
- * Effects, as Figma's, each added with "+" and taken off with "−", none taking room unless used: a drop shadow, an
+ * Effects, each added with "+" and taken off with "−", none taking room unless used: a drop shadow, an
  * inner shadow (`inner`: for what has a box of its own to cast it in), a layer blur, a background blur — and faded
  * edges, a video editor's.
  *
@@ -986,7 +1026,7 @@ export function EffectsSection({ look, t, inner = false }: { look: Look; t: T; i
             </button>
           )}
         >
-          <div className="min-w-[140px] rounded-[7px] border border-[var(--border)] bg-[var(--surface)] p-1 shadow-[var(--shadow-lg)]">
+          <div className="min-w-[140px] rounded-[7px] border border-[var(--border)] bg-[var(--bg-raised)] p-1 shadow-[var(--shadow-lg)]">
             {missing.map((m) => (
               <button
                 key={m.id}
@@ -1067,7 +1107,7 @@ export function EffectsSection({ look, t, inner = false }: { look: Look; t: T; i
         <>
           <SubLabel aside={removeBtn('fade')}>{t('inspector.fade')}</SubLabel>
           <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-1.5">
-            <div role="group" aria-label={t('inspector.fadeSides')} className="flex h-[26px] items-center gap-0.5 rounded-[5px] bg-[var(--fill-tsp)] p-px">
+            <div role="group" aria-label={t('inspector.fadeSides')} className="flex h-[26px] items-center gap-0.5 rounded-[5px] bg-[var(--bg-field)] p-px">
               {(['top', 'right', 'bottom', 'left'] as const).map((side) => {
                 const on = fadeOn(side) === true;
                 return (
@@ -1079,7 +1119,7 @@ export function EffectsSection({ look, t, inner = false }: { look: Look; t: T; i
                     title={t(`inspector.fadeSide.${side}`)}
                     onClick={() => fadeToggle(side)}
                     className={`flex h-6 flex-1 items-center justify-center rounded-[4px] transition ${on
-                      ? 'bg-[var(--bg)] text-[var(--text)] shadow-[0_0_0_0.5px_var(--border-strong)]'
+                      ? 'bg-[var(--bg-panel)] text-[var(--text)] shadow-[0_0_0_0.5px_var(--border-strong)]'
                       : 'text-[var(--text-faint)] hover:text-[var(--text)]'}`}
                   >
                     <EdgeGlyph side={side} />
@@ -1110,7 +1150,7 @@ export function EffectsSection({ look, t, inner = false }: { look: Look; t: T; i
 /** What a type property is when nothing sets it (what giving up a preview paints back when the layer had none). */
 const TYPE_NEUTRAL: Record<string, string> = { 'font-weight': '400', 'font-style': 'normal', 'line-height': 'normal', 'letter-spacing': 'normal' };
 
-/** A family's weight menu: its own weights and italics by name, as Figma's ("Semi Bold", "Bold Italic"). */
+/** A family's weight menu: its own weights and italics by name ("Semi Bold", "Bold Italic"). */
 function weightOptions(styles: FontStyles | null, t: T): { value: string; label: string }[] {
   const list = styleOptions(styles ?? { weights: NAMED_WEIGHTS });
   return list.map((s) => {
@@ -1122,7 +1162,7 @@ function weightOptions(styles: FontStyles | null, t: T): { value: string; label:
 }
 
 /**
- * Type, as Figma's typography panel: font (its menu shows each family on the picture as it is pointed at), weight
+ * Type: font (its menu shows each family on the picture as it is pointed at), weight
  * (the family's own), size (with a menu of common sizes), line height, letter spacing, alignment, case
  * (`text-transform`) and color. Text in an SVG has no line layout and is colored by its fill.
  */
@@ -1208,7 +1248,7 @@ export function TypographySection({ look, t, svg, sample }: { look: Look; t: T; 
           before.current = null;
           look.commit(edit);
         }}
-        className="group/field relative flex h-[26px] min-w-0 w-full items-center overflow-hidden rounded-[5px] bg-[var(--fill-tsp)] ring-1 ring-inset ring-transparent transition-[box-shadow,background-color] hover:ring-[var(--border)] focus-within:bg-[var(--bg)] focus-within:ring-[1.5px] focus-within:ring-[var(--accent)]"
+        className="group/field relative flex h-[26px] min-w-0 w-full items-center overflow-hidden rounded-[5px] bg-[var(--bg-field)] ring-1 ring-inset ring-transparent transition-[box-shadow,background-color] hover:ring-[var(--border)] focus-within:bg-[var(--bg-panel)] focus-within:ring-[1.5px] focus-within:ring-[var(--accent)]"
       />
       <Row>
         <SelectField
@@ -1286,7 +1326,7 @@ export function TypographySection({ look, t, svg, sample }: { look: Look; t: T; 
   );
 }
 
-/** The font size field's menu: the common sizes, as Figma's; the one under the pointer shown before it is picked. */
+/** The font size field's menu: the common sizes; the one under the pointer shown before it is picked. */
 function FontSizeMenu({ t, onPick, onPreview, onRevert }: { t: T; onPick: (n: number) => void; onPreview: (n: number) => void; onRevert: () => void }) {
   const [open, setOpen] = React.useState(false);
   const previewing = React.useRef(false);
@@ -1317,7 +1357,7 @@ function FontSizeMenu({ t, onPick, onPreview, onRevert }: { t: T; onPick: (n: nu
         role="listbox"
         aria-label={t('inspector.fontSizes')}
         onMouseLeave={() => show(null)}
-        className="w-[72px] overflow-y-auto rounded-[8px] border border-[var(--border)] bg-[var(--panel)] py-1 shadow-[var(--shadow-lg)]"
+        className="w-[72px] overflow-y-auto rounded-[8px] border border-[var(--border)] bg-[var(--bg-raised)] py-1 shadow-[var(--shadow-lg)]"
         style={{ maxHeight: 'min(320px, var(--popover-max-h, 320px))' }}
       >
         {FONT_SIZES.map((n) => (
@@ -1402,7 +1442,7 @@ export function AdvancedSection({
               if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); }
               if (e.key === 'Escape') { e.preventDefault(); dropDraft.current = true; e.currentTarget.blur(); }
             }}
-            className="h-[26px] w-full rounded-[5px] bg-[var(--fill-tsp)] px-2 font-mono text-[10.5px] text-[var(--text)] outline-none ring-1 ring-inset ring-transparent placeholder:text-[var(--text-faint)] hover:ring-[var(--border)] focus:bg-[var(--bg)] focus:ring-[1.5px] focus:ring-[var(--accent)]"
+            className="h-[26px] w-full rounded-[5px] bg-[var(--bg-field)] px-2 font-mono text-[10.5px] text-[var(--text)] outline-none ring-1 ring-inset ring-transparent placeholder:text-[var(--text-faint)] hover:ring-[var(--border)] focus:bg-[var(--bg-panel)] focus:ring-[1.5px] focus:ring-[var(--accent)]"
           />
         </label>
       ) : null}
@@ -1423,7 +1463,7 @@ export function AdvancedSection({
           if (e.key === 'Escape') { e.preventDefault(); dropDraft.current = true; e.currentTarget.blur(); }
         }}
         rows={Math.min(8, Math.max(2, (draft ?? css).split('\n').length))}
-        className="block w-full resize-y rounded-[5px] bg-[var(--fill-tsp)] px-2 py-1.5 font-mono text-[10.5px] leading-[1.5] text-[var(--text)] outline-none ring-1 ring-inset ring-transparent placeholder:text-[var(--text-faint)] hover:ring-[var(--border)] focus:bg-[var(--bg)] focus:ring-[1.5px] focus:ring-[var(--accent)]"
+        className="block w-full resize-y rounded-[5px] bg-[var(--bg-field)] px-2 py-1.5 font-mono text-[10.5px] leading-[1.5] text-[var(--text)] outline-none ring-1 ring-inset ring-transparent placeholder:text-[var(--text-faint)] hover:ring-[var(--border)] focus:bg-[var(--bg-panel)] focus:ring-[1.5px] focus:ring-[var(--accent)]"
       />
     </Section>
   );
